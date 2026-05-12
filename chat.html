@@ -1,0 +1,1408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DeepAgent Chat</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:      #0d1117;
+    --bg2:     #161b22;
+    --bg3:     #21262d;
+    --bg4:     #2a2f36;
+    --border:  #30363d;
+    --text:    #c9d1d9;
+    --dim:     #6e7681;
+    --user-bg: #1f6feb;
+    --green:   #3fb950;
+    --yellow:  #d29922;
+    --red:     #f85149;
+    --blue:    #58a6ff;
+    --purple:  #bc8cff;
+    --radius:  10px;
+    --sidebar: 220px;
+  }
+
+  html, body { height: 100%; overflow: hidden; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 14px;
+    display: flex;
+    height: 100vh;
+  }
+
+  /* ── Sidebar ── */
+  #sidebar {
+    width: var(--sidebar);
+    flex-shrink: 0;
+    background: var(--bg2);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .sb-head {
+    padding: 14px 10px 10px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .logo {
+    width: 28px; height: 28px;
+    background: linear-gradient(135deg, #1f6feb, #bc8cff);
+    border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700; color: #fff;
+    flex-shrink: 0;
+  }
+
+  .sb-title { font-size: 13px; font-weight: 600; flex: 1; }
+
+  #newChatBtn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--dim);
+    cursor: pointer;
+    font-size: 18px; line-height: 1;
+    width: 28px; height: 28px;
+    display: flex; align-items: center; justify-content: center;
+    transition: border-color .2s, color .2s;
+    flex-shrink: 0;
+  }
+  #newChatBtn:hover { border-color: var(--blue); color: var(--blue); }
+  #newChatBtn:disabled { opacity: .4; cursor: not-allowed; }
+
+  #sessionList {
+    flex: 1; overflow-y: auto; padding: 6px;
+  }
+  #sessionList::-webkit-scrollbar { width: 4px; }
+  #sessionList::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  .sess-empty { padding: 14px 8px; font-size: 12px; color: var(--dim); text-align: center; }
+
+  .session-item {
+    padding: 6px 8px; border-radius: 6px;
+    transition: background .15s;
+    display: flex; align-items: flex-start; gap: 4px;
+  }
+  .session-item:hover { background: var(--bg3); }
+  .session-item.active { background: var(--bg3); }
+
+  .si-body { flex: 1; min-width: 0; cursor: pointer; }
+
+  .si-title {
+    font-size: 12.5px; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    display: flex; align-items: center; gap: 4px;
+  }
+  .si-pin-dot { color: var(--yellow); font-size: 9px; flex-shrink: 0; }
+  .si-time { font-size: 10.5px; color: var(--dim); margin-top: 2px; }
+
+  .si-actions {
+    display: none; flex-direction: column; gap: 1px;
+    flex-shrink: 0; padding-top: 1px;
+  }
+  .session-item:hover .si-actions { display: flex; }
+
+  .si-btn {
+    background: none; border: none; border-radius: 3px;
+    cursor: pointer; color: var(--dim); font-size: 12px; line-height: 1;
+    width: 20px; height: 20px;
+    display: flex; align-items: center; justify-content: center;
+    transition: color .15s, background .15s;
+  }
+  .si-btn:hover                { background: var(--border); color: var(--text); }
+  .si-btn.si-pin.is-pinned     { color: var(--yellow); }
+  .si-btn.si-del.is-confirming { color: var(--red); background: rgba(248,81,73,.15); }
+
+  /* ── Main ── */
+  #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+
+  header {
+    background: var(--bg2); border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
+    display: flex; align-items: center; gap: 10px;
+    flex-shrink: 0;
+  }
+  header h1 { font-size: 14px; font-weight: 600; }
+  header .sub { font-size: 11px; color: var(--dim); margin-top: 1px; }
+
+  .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--yellow); margin-left: auto; transition: background .3s;
+  }
+  .status-dot.ready { background: var(--green); }
+  .status-dot.busy  { background: var(--yellow); animation: pulse 1s infinite; }
+  .status-dot.error { background: var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+  /* ── Messages ── */
+  #messages {
+    flex: 1; overflow-y: auto;
+    padding: 24px 20px;
+    display: flex; flex-direction: column; gap: 20px;
+    scroll-behavior: smooth;
+  }
+  #messages::-webkit-scrollbar { width: 6px; }
+  #messages::-webkit-scrollbar-track { background: transparent; }
+  #messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* ── Bubbles ── */
+  .msg { display: flex; gap: 10px; }
+  .msg.user  { flex-direction: row-reverse; }
+
+  .avatar {
+    width: 32px; height: 32px; border-radius: 8px; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 13px; font-weight: 700;
+  }
+  .msg.user  .avatar { background: var(--user-bg); color: #fff; }
+  .msg.agent .avatar { background: var(--bg3); color: var(--purple); border: 1px solid var(--border); }
+
+  /* User bubble */
+  .msg.user .bubble {
+    max-width: calc(100% - 80px);
+    background: var(--user-bg); color: #fff;
+    border-radius: var(--radius); border-bottom-right-radius: 2px;
+    padding: 10px 14px; line-height: 1.7; word-break: break-word;
+  }
+
+  /* Agent bubble */
+  .msg.agent .bubble {
+    max-width: 100%;
+    background: transparent;
+    border: none;
+    padding: 0;
+    line-height: 1.7;
+    word-break: break-word;
+  }
+
+  /* Thinking state */
+  .agent-thinking {
+    display: flex; align-items: center; gap: 8px;
+    color: var(--dim); font-size: 13px;
+  }
+
+  .spinner {
+    width: 13px; height: 13px; flex-shrink: 0;
+    border: 2px solid transparent;
+    border-top-color: var(--yellow);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ═══════════════════════════════════════
+     ROUND CARD - New timeline layout
+     ═══════════════════════════════════════ */
+
+  .round-card {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-bottom: 12px;
+    overflow: hidden;
+    animation: fadeIn .3s ease;
+  }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  .round-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px;
+    background: var(--bg3);
+    border-bottom: 1px solid var(--border);
+    font-size: 13px; font-weight: 600;
+  }
+
+  .round-number { color: var(--blue); }
+  .round-focus { color: var(--yellow); font-weight: 400; font-size: 12px; margin-left: 4px; }
+
+  .node-badge {
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 12px;
+    font-weight: 500;
+  }
+  .node-badge.planning   { background: rgba(88,166,255,.15); color: var(--blue); }
+  .node-badge.executing  { background: rgba(63,185,80,.15);  color: var(--green); }
+  .node-badge.reflecting { background: rgba(188,140,255,.15); color: var(--purple); }
+  .node-badge.done       { background: rgba(63,185,80,.15);  color: var(--green); }
+
+  /* Panels */
+  .panel {
+    border-bottom: 1px solid var(--border);
+  }
+  .panel:last-child { border-bottom: none; }
+
+  .panel-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 14px;
+    cursor: pointer;
+    user-select: none;
+    transition: background .15s;
+    font-size: 12.5px;
+  }
+  .panel-header:hover { background: var(--bg4); }
+
+  .panel-icon { font-size: 14px; }
+
+  .panel-arrow {
+    transition: transform .2s;
+    font-size: 10px; color: var(--dim);
+  }
+  .panel-arrow.open { transform: rotate(90deg); }
+
+  .panel-label { font-weight: 500; flex: 1; }
+
+  .panel-body {
+    display: none;
+    padding: 8px 14px 12px;
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--text);
+  }
+  .panel-body.open { display: block; }
+
+  /* Code blocks */
+  .code-block {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 6px 0;
+    overflow-x: auto;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--green);
+    position: relative;
+  }
+
+  .code-copy-btn {
+    position: absolute;
+    top: 6px; right: 6px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--dim);
+    cursor: pointer;
+    font-size: 11px;
+    padding: 2px 6px;
+    opacity: 0;
+    transition: opacity .2s, color .2s;
+  }
+  .code-block:hover .code-copy-btn { opacity: 1; }
+  .code-copy-btn:hover { color: var(--text); }
+
+  /* Task items */
+  .task-item {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .task-item:last-child { border-bottom: none; }
+
+  .task-meta {
+    display: flex; align-items: center; gap: 6px;
+    margin-bottom: 4px;
+  }
+
+  .tool-tag {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--bg3);
+    color: var(--dim);
+    font-family: monospace;
+  }
+
+  .task-desc { color: var(--dim); font-size: 12px; }
+
+  /* Output items */
+  .output-item {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .output-item:last-child { border-bottom: none; }
+
+  .output-status {
+    display: flex; align-items: center; gap: 8px;
+    margin-bottom: 4px;
+  }
+
+  .output-meta-inline {
+    font-size: 11px; color: var(--dim);
+    display: flex; gap: 10px;
+  }
+
+  .output-preview-area {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 8px 10px;
+    margin-top: 6px;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+    display: none;
+  }
+  .output-preview-area.open { display: block; }
+
+  .output-toggle {
+    font-size: 11px; color: var(--blue);
+    cursor: pointer; user-select: none;
+  }
+  .output-toggle:hover { text-decoration: underline; }
+
+  /* Badges */
+  .badge {
+    display: inline-block;
+    font-size: 11px;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-weight: 500;
+  }
+  .badge.confirmed { background: rgba(88,166,255,.2); color: var(--blue); }
+  .badge.suspected { background: rgba(210,153,34,.2); color: var(--yellow); }
+  .badge.no_finding { background: rgba(110,118,129,.15); color: var(--dim); }
+  .badge.success  { background: rgba(63,185,80,.15);  color: var(--green); }
+  .badge.fail     { background: rgba(248,81,73,.15);  color: var(--red); }
+
+  /* Reflection */
+  .reflection-summary {
+    color: var(--text);
+    margin: 6px 0;
+  }
+
+  .next-direction {
+    color: var(--yellow);
+    font-size: 12px;
+    margin-top: 6px;
+    padding: 6px 8px;
+    background: rgba(210,153,34,.08);
+    border-radius: 4px;
+  }
+
+  .next-payloads {
+    margin-top: 6px;
+  }
+  .next-payloads code {
+    display: block;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    margin: 3px 0;
+    font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 11px;
+    color: var(--green);
+  }
+
+  /* Vuln alert */
+  .vuln-alert {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px;
+    background: rgba(88,166,255,.08);
+    border: 1px solid rgba(88,166,255,.2);
+    border-radius: 6px;
+    margin: 6px 0;
+    font-size: 12.5px;
+  }
+  .vuln-alert .vuln-type { color: var(--blue); font-weight: 600; }
+  .vuln-alert .vuln-proof { color: var(--text); margin-left: 4px; }
+
+  /* Reasoning */
+  .reasoning-text {
+    color: var(--blue);
+    font-size: 12.5px;
+    line-height: 1.6;
+    padding: 8px;
+    background: rgba(88,166,255,.06);
+    border-radius: 4px;
+    border-left: 3px solid var(--blue);
+  }
+
+  /* ═══════════════════════════════════════
+     Markdown rendered output
+     ═══════════════════════════════════════ */
+
+  .md-content {
+    font-size: 14px;
+    line-height: 1.8;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .md-content h2, .md-content .md-h2 {
+    font-size: 17px; font-weight: 600; color: var(--text);
+    margin: 20px 0 8px; padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+  .md-content h3, .md-content .md-h3 {
+    font-size: 15px; font-weight: 600; color: var(--text);
+    margin: 14px 0 6px;
+  }
+  .md-content h4, .md-content .md-h4 {
+    font-size: 14px; font-weight: 600; color: var(--text);
+    margin: 12px 0 4px;
+  }
+  .md-content p, .md-content .md-p { margin: 6px 0; }
+  .md-content ul, .md-content .md-ul {
+    padding-left: 24px; margin: 6px 0; list-style-type: disc;
+  }
+  .md-content li, .md-content .md-li { margin: 3px 0; line-height: 1.6; }
+  .md-content pre {
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 12px; margin: 10px 0;
+    overflow-x: auto; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 12.5px; line-height: 1.6;
+  }
+  .md-content code {
+    background: var(--bg2); border-radius: 3px;
+    padding: 1px 5px; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 12.5px;
+  }
+  .md-content pre code { background: none; padding: 0; }
+  .md-content hr, .md-content .md-hr {
+    border: none; border-top: 1px solid var(--border); margin: 16px 0;
+  }
+  .md-content strong { color: var(--text); font-weight: 600; }
+
+  .copy-btn {
+    margin-top: 10px;
+    background: none; border: 1px solid var(--border);
+    border-radius: 6px; color: var(--dim);
+    padding: 4px 10px; cursor: pointer; font-size: 12px;
+    transition: color .15s, border-color .15s;
+  }
+  .copy-btn:hover { color: var(--text); border-color: var(--blue); }
+
+  /* Error state */
+  .agent-error { color: var(--red); font-size: 13px; }
+
+  /* ── Settings bar ── */
+  .settings-bar {
+    display: flex; gap: 12px; align-items: center;
+    padding: 4px 16px 6px;
+    background: var(--bg2); font-size: 12px; color: var(--dim);
+    border-top: 1px solid var(--border); flex-shrink: 0;
+  }
+  .settings-bar label { display: flex; align-items: center; gap: 4px; }
+  .settings-bar input[type=number] {
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 4px; color: var(--text);
+    font-size: 12px; padding: 2px 5px; width: 52px; outline: none;
+  }
+
+  /* ── Input bar ── */
+  #inputbar {
+    background: var(--bg2); border-top: 1px solid var(--border);
+    padding: 10px 16px;
+    display: flex; gap: 8px; align-items: flex-end; flex-shrink: 0;
+  }
+  #inputbar textarea {
+    flex: 1;
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: var(--radius); color: var(--text);
+    font-family: inherit; font-size: 14px; line-height: 1.5;
+    padding: 9px 12px; resize: none; outline: none;
+    min-height: 42px; max-height: 140px; overflow-y: auto;
+    transition: border-color .2s;
+  }
+  #inputbar textarea:focus { border-color: var(--blue); }
+  #inputbar textarea::placeholder { color: var(--dim); }
+
+  #sendBtn {
+    background: var(--user-bg); border: none;
+    border-radius: var(--radius); color: #fff;
+    cursor: pointer; font-size: 18px;
+    width: 42px; height: 42px;
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; transition: background .2s, opacity .2s;
+  }
+  #sendBtn:hover:not(:disabled) { background: #388bfd; }
+  #sendBtn:disabled { opacity: .4; cursor: not-allowed; }
+
+  #stopBtn {
+    background: rgba(248,81,73,.15); border: 1px solid var(--red);
+    border-radius: var(--radius); color: var(--red);
+    cursor: pointer; font-size: 13px; font-weight: 600;
+    height: 42px; padding: 0 14px;
+    display: none; align-items: center; justify-content: center; gap: 5px;
+    flex-shrink: 0; transition: background .2s;
+    white-space: nowrap;
+  }
+  #stopBtn:hover { background: rgba(248,81,73,.28); }
+  #stopBtn.visible { display: flex; }
+
+  /* ── Welcome ── */
+  .welcome {
+    flex: 1; display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    text-align: center; padding: 24px; gap: 8px; color: var(--dim);
+  }
+  .welcome .wicon { font-size: 40px; margin-bottom: 8px; }
+  .welcome h2 { font-size: 18px; color: var(--text); font-weight: 600; }
+  .welcome p  { font-size: 13px; line-height: 1.7; max-width: 400px; }
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 12px; }
+  .pill {
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 20px; padding: 5px 14px;
+    font-size: 12.5px; cursor: pointer;
+    transition: border-color .2s, background .2s;
+  }
+  .pill:hover { border-color: var(--blue); background: var(--bg2); }
+</style>
+</head>
+<body>
+
+<!-- Sidebar -->
+<div id="sidebar">
+  <div class="sb-head">
+    <div class="logo">D</div>
+    <span class="sb-title">DeepAgent</span>
+    <button id="newChatBtn" title="新建对话">+</button>
+  </div>
+  <div id="sessionList"></div>
+</div>
+
+<!-- Main -->
+<div id="main">
+  <header>
+    <div>
+      <h1>DeepAgent</h1>
+      <div class="sub">Planner · Executor · Reflector</div>
+    </div>
+    <div id="statusDot" class="status-dot" title="连接中..."></div>
+  </header>
+
+  <div id="messages">
+    <div class="welcome" id="welcome">
+      <div class="wicon">🤖</div>
+      <h2>DeepAgent 已就绪</h2>
+      <p>自主 AI Agent，规划、执行并反思复杂任务。<br>输入目标，Agent 将自动分解并逐步完成。</p>
+      <div class="pills">
+        <div class="pill" onclick="fillExample(this)">对 http://target.com 进行端口扫描</div>
+        <div class="pill" onclick="fillExample(this)">搜索 SQL 注入相关的 Payload</div>
+        <div class="pill" onclick="fillExample(this)">用 Python 写一个端口扫描脚本并运行</div>
+        <div class="pill" onclick="fillExample(this)">检查知识库中有哪些 XSS 技巧</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="settings-bar">
+    <label>最大轮次
+      <input type="number" id="maxIter" value="10" min="1" max="50">
+    </label>
+    <span id="memoryDisp" style="font-size:11px;color:var(--dim);cursor:pointer;" title="点击清除会话记忆" onclick="clearMemory()"></span>
+    <span id="roundDisp" style="margin-left:auto;font-size:11px;color:var(--dim);"></span>
+  </div>
+
+  <div id="inputbar">
+    <textarea id="input"
+      placeholder="输入任务目标... (Shift+Enter 换行，Enter 发送)"
+      rows="1"></textarea>
+    <button id="stopBtn" title="打断当前任务">■ 打断</button>
+    <button id="sendBtn" title="发送" disabled>&#9654;</button>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════
+// localStorage
+// ═══════════════════════════════════════════════════
+
+const STORE_KEY = 'deepagent_sessions';
+
+function loadSessions() {
+  try { return JSON.parse(localStorage.getItem(STORE_KEY) || '[]'); }
+  catch { return []; }
+}
+function persistSessions(arr) { localStorage.setItem(STORE_KEY, JSON.stringify(arr)); }
+
+function saveTurn(sid, goal, summary, findings) {
+  const sessions = loadSessions();
+  const idx = sessions.findIndex(s => s.id === sid);
+  const turn = { goal, summary, findings };
+  if (idx >= 0) {
+    sessions[idx].turns.push(turn);
+    sessions[idx].updatedAt = Date.now();
+  } else {
+    sessions.unshift({ id: sid, title: goal.slice(0, 60), createdAt: Date.now(), updatedAt: Date.now(), turns: [turn] });
+  }
+  persistSessions(sessions);
+  renderSidebar();
+}
+
+function fmtTime(ts) {
+  const diff = Date.now() - ts;
+  if (diff < 60000)    return '刚刚';
+  if (diff < 3600000)  return Math.floor(diff / 60000) + ' 分钟前';
+  if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前';
+  const d = new Date(ts);
+  return `${d.getMonth()+1}/${d.getDate()}`;
+}
+
+function renderSidebar() {
+  const list = document.getElementById('sessionList');
+  list.innerHTML = '';
+  let sessions = loadSessions();
+  if (!sessions.length) {
+    list.innerHTML = '<div class="sess-empty">暂无历史会话</div>';
+    return;
+  }
+  sessions = [...sessions].sort((a, b) => {
+    if (a.pinned && !b.pinned) return -1;
+    if (!a.pinned && b.pinned) return 1;
+    return (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt);
+  });
+  sessions.forEach(s => {
+    const item = document.createElement('div');
+    item.className = 'session-item' + (s.id === currentSid ? ' active' : '');
+
+    const body = document.createElement('div');
+    body.className = 'si-body';
+    body.innerHTML = `
+      <div class="si-title">
+        ${s.pinned ? '<span class="si-pin-dot">●</span>' : ''}
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escHtml(s.title)}</span>
+      </div>
+      <div class="si-time">${fmtTime(s.updatedAt || s.createdAt)}</div>`;
+    body.addEventListener('click', () => openSession(s.id));
+
+    const actions = document.createElement('div');
+    actions.className = 'si-actions';
+
+    const pinBtn = document.createElement('button');
+    pinBtn.className = 'si-btn si-pin' + (s.pinned ? ' is-pinned' : '');
+    pinBtn.title = s.pinned ? '取消置顶' : '置顶';
+    pinBtn.textContent = '↑';
+    pinBtn.addEventListener('click', e => { e.stopPropagation(); togglePin(s.id); });
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'si-btn si-del';
+    delBtn.title = '删除会话（再次点击确认）';
+    delBtn.textContent = '×';
+    let delTimer = null;
+    delBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      if (delBtn.classList.contains('is-confirming')) {
+        clearTimeout(delTimer);
+        deleteSession(s.id);
+      } else {
+        delBtn.classList.add('is-confirming');
+        delBtn.textContent = '?';
+        delTimer = setTimeout(() => {
+          delBtn.classList.remove('is-confirming');
+          delBtn.textContent = '×';
+        }, 2000);
+      }
+    });
+
+    actions.appendChild(pinBtn);
+    actions.appendChild(delBtn);
+    item.appendChild(body);
+    item.appendChild(actions);
+    list.appendChild(item);
+  });
+}
+
+function togglePin(sid) {
+  const sessions = loadSessions();
+  const s = sessions.find(x => x.id === sid);
+  if (!s) return;
+  s.pinned = !s.pinned;
+  persistSessions(sessions);
+  renderSidebar();
+}
+
+function deleteSession(sid) {
+  const sessions = loadSessions();
+  persistSessions(sessions.filter(s => s.id !== sid));
+  if (sid === currentSid) {
+    startNewChat();
+  } else {
+    renderSidebar();
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════
+
+let currentSid    = 'sess_' + Math.random().toString(36).slice(2, 10);
+let ws            = null;
+let isBusy        = false;
+let currentBubble = null;
+let frontendRound = 0;
+let lastGoal      = '';
+let lastSummary   = '';
+let lastFindings  = [];
+let _reconnect    = true;
+let memoryCount   = 0;
+let currentRoundCard = null;  // current active round card element
+
+const statusDot  = document.getElementById('statusDot');
+const sendBtn    = document.getElementById('sendBtn');
+const stopBtn    = document.getElementById('stopBtn');
+const input      = document.getElementById('input');
+const messages   = document.getElementById('messages');
+const roundDisp  = document.getElementById('roundDisp');
+const memoryDisp = document.getElementById('memoryDisp');
+const newChatBtn = document.getElementById('newChatBtn');
+
+// ═══════════════════════════════════════════════════
+// WebSocket
+// ═══════════════════════════════════════════════════
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/${currentSid}`);
+  ws.onopen    = () => { setStatus('ready'); sendBtn.disabled = false; _reconnect = true; };
+  ws.onclose   = () => { setStatus('error'); sendBtn.disabled = true; if (_reconnect) setTimeout(connect, 3000); };
+  ws.onerror   = () => setStatus('error');
+  ws.onmessage = e => handleMessage(JSON.parse(e.data));
+}
+connect();
+
+function setStatus(s) {
+  statusDot.className = 'status-dot ' + s;
+  statusDot.title = ({ '':'连接中...', ready:'已连接', busy:'运行中...', error:'断开' })[s] || '';
+}
+function setBusy(v) {
+  isBusy = v; sendBtn.disabled = v; newChatBtn.disabled = v;
+  setStatus(v ? 'busy' : 'ready');
+  if (v) {
+    stopBtn.classList.add('visible');
+  } else {
+    stopBtn.classList.remove('visible');
+    roundDisp.textContent = '';
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// New Chat / Open Session
+// ═══════════════════════════════════════════════════
+
+newChatBtn.addEventListener('click', () => { if (!isBusy) startNewChat(); });
+
+function startNewChat() {
+  currentSid = 'sess_' + Math.random().toString(36).slice(2, 10);
+  memoryCount = 0;
+  updateMemoryDisp();
+  _reconnect = false;
+  if (ws) ws.close();
+  _reconnect = true;
+  connect();
+  messages.innerHTML = '';
+  showWelcome();
+  renderSidebar();
+  input.focus();
+}
+
+function showWelcome() {
+  const w = document.createElement('div');
+  w.id = 'welcome'; w.className = 'welcome';
+  w.innerHTML = `
+    <div class="wicon">🤖</div>
+    <h2>DeepAgent 已就绪</h2>
+    <p>自主 AI Agent，规划、执行并反思复杂任务。<br>输入目标，Agent 将自动分解并逐步完成。</p>
+    <div class="pills">
+      <div class="pill" onclick="fillExample(this)">对 http://target.com 进行端口扫描</div>
+      <div class="pill" onclick="fillExample(this)">搜索 SQL 注入相关的 Payload</div>
+      <div class="pill" onclick="fillExample(this)">用 Python 写一个端口扫描脚本并运行</div>
+      <div class="pill" onclick="fillExample(this)">检查知识库中有哪些 XSS 技巧</div>
+    </div>`;
+  messages.appendChild(w);
+}
+
+function openSession(sid) {
+  if (isBusy) return;
+  const s = loadSessions().find(x => x.id === sid);
+  if (!s) return;
+  currentSid = sid;
+  memoryCount = s.turns ? s.turns.length : 0;
+  updateMemoryDisp();
+  _reconnect = false;
+  if (ws) ws.close();
+  _reconnect = true;
+  connect();
+  messages.innerHTML = '';
+  s.turns.forEach(t => {
+    appendUserMsg(t.goal);
+    appendResultBubble(t.summary, t.findings || []);
+  });
+  scrollBottom();
+  renderSidebar();
+}
+
+// ═══════════════════════════════════════════════════
+// Send
+// ═══════════════════════════════════════════════════
+
+function send() {
+  const goal = input.value.trim();
+  if (!goal || isBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
+  document.getElementById('welcome')?.remove();
+  lastGoal = goal;
+  appendUserMsg(goal);
+  input.value = ''; autoResize();
+  const maxIter = parseInt(document.getElementById('maxIter').value) || 10;
+  ws.send(JSON.stringify({ goal, max_iterations: maxIter, thread_id: currentSid }));
+  setBusy(true);
+}
+
+// ═══════════════════════════════════════════════════
+// Message handling
+// ═══════════════════════════════════════════════════
+
+const NODE_LABELS = {
+  planner: '规划', executor: '执行', executors: '执行',
+  reflector: '反思', compressor: '压缩', summarizer: '总结',
+};
+
+function handleMessage(data) {
+  switch (data.type) {
+
+    case 'start':
+      currentRoundCard = null;
+      frontendRound = 0;
+      lastSummary   = '';
+      lastFindings  = [];
+      break;
+
+    case 'progress': {
+      if (data.node === 'planner') {
+        frontendRound++;
+        currentRoundCard = createRoundCard(frontendRound, data.vuln_focus);
+      }
+
+      if (!currentRoundCard) return;
+
+      roundDisp.textContent = `第 ${frontendRound} 轮 · ${NODE_LABELS[data.node] || data.node}`;
+
+      if (data.node === 'planner') {
+        updatePlanningPanel(currentRoundCard, data);
+      } else if (data.node === 'executors') {
+        updateExecutionPanel(currentRoundCard, data);
+      } else if (data.node === 'reflector') {
+        updateReflectionPanel(currentRoundCard, data);
+      }
+
+      break;
+    }
+
+    case 'done': {
+      // Collapse all round cards
+      document.querySelectorAll('.round-card').forEach(card => {
+        collapseAllPanels(card);
+      });
+      // Show final report
+      const finalReport = (data.final_report || '').trim();
+      const summary  = finalReport || (data.summary || lastSummary || '').trim();
+      const findings = (data.key_findings && data.key_findings.length) ? data.key_findings : lastFindings;
+
+      if (currentRoundCard) {
+        // Mark last round as done
+        const badge = currentRoundCard.querySelector('.node-badge');
+        if (badge) {
+          badge.className = 'node-badge done';
+          badge.textContent = '完成';
+        }
+      }
+
+      showResultBubble(summary, findings, finalReport);
+      currentRoundCard = null;
+      setBusy(false);
+      if (lastGoal) {
+        saveTurn(currentSid, lastGoal, summary || lastSummary, findings);
+        memoryCount++;
+        updateMemoryDisp();
+        lastGoal = '';
+      }
+      break;
+    }
+
+    case 'interrupted': {
+      if (currentRoundCard) {
+        const badge = currentRoundCard.querySelector('.node-badge');
+        if (badge) {
+          badge.style.background = 'rgba(210,153,34,.15)';
+          badge.style.color = 'var(--yellow)';
+          badge.textContent = '已打断';
+        }
+      }
+      setBusy(false);
+      break;
+    }
+
+    case 'error':
+      if (currentRoundCard) {
+        currentRoundCard.innerHTML += `<div style="color:var(--red);padding:10px;font-size:13px;">✗ ${escHtml(data.message)}</div>`;
+      } else {
+        const b = appendThinkingBubble();
+        b.innerHTML = `<div class="agent-error">✗ ${escHtml(data.message)}</div>`;
+      }
+      currentRoundCard = null;
+      setBusy(false);
+      break;
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// Round Card DOM builders
+// ═══════════════════════════════════════════════════
+
+function createRoundCard(round, vulnFocus) {
+  // Collapse previous card if exists
+  if (currentRoundCard) collapseAllPanels(currentRoundCard);
+
+  const card = document.createElement('div');
+  card.className = 'round-card';
+
+  const headerHTML = `
+    <div class="round-header">
+      <span class="round-number">Round ${round}</span>
+      ${vulnFocus ? `<span class="round-focus">${escHtml(vulnFocus)}</span>` : ''}
+      <span class="node-badge planning">规划中</span>
+    </div>`;
+
+  card.innerHTML = headerHTML + `
+    <div class="panel" data-panel="planning">
+      <div class="panel-header" onclick="togglePanel(this)">
+        <span class="panel-arrow">▶</span>
+        <span class="panel-icon">🧠</span>
+        <span class="panel-label">规划</span>
+      </div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-panel="execution">
+      <div class="panel-header" onclick="togglePanel(this)">
+        <span class="panel-arrow">▶</span>
+        <span class="panel-icon">⚡</span>
+        <span class="panel-label">执行</span>
+      </div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-panel="reflection">
+      <div class="panel-header" onclick="togglePanel(this)">
+        <span class="panel-arrow">▶</span>
+        <span class="panel-icon">💭</span>
+        <span class="panel-label">反思</span>
+      </div>
+      <div class="panel-body"></div>
+    </div>`;
+
+  const bubble = currentBubble || appendAgentBubbleForCard();
+  bubble.appendChild(card);
+  scrollBottom();
+
+  // Auto-open planning panel for new card
+  const planHeader = card.querySelector('[data-panel="planning"] .panel-header');
+  if (planHeader) togglePanel(planHeader);
+
+  return card;
+}
+
+function updatePlanningPanel(card, data) {
+  const panel = card.querySelector('[data-panel="planning"]');
+  if (!panel) return;
+  const body = panel.querySelector('.panel-body');
+
+  let html = '';
+
+  // Reasoning
+  if (data.reasoning) {
+    html += `<div class="reasoning-text">${escHtml(data.reasoning.slice(0, 500))}${data.reasoning.length > 500 ? '…' : ''}</div>`;
+  }
+
+  // Tasks
+  if (data.tasks && data.tasks.length) {
+    html += `<div style="margin-top:8px;font-size:12px;color:var(--dim);font-weight:500;">任务列表</div>`;
+    data.tasks.forEach((t, i) => {
+      const args = t.arguments || {};
+      html += `<div class="task-item">
+        <div class="task-meta">
+          <span class="tool-tag">${escHtml(t.tool || '?')}</span>
+          ${t.description ? `<span class="task-desc">${escHtml(t.description)}</span>` : ''}
+        </div>`;
+
+      // Show code for execute_python / execute_shell
+      if (args.code) {
+        html += renderCodeBlock(args.code, `task_${i}`);
+      } else if (Object.keys(args).length > 0) {
+        // Show other arguments as key-value
+        const argStr = Object.entries(args).map(([k, v]) => `${k}: ${escHtml(String(v).slice(0, 150))}`).join(' | ');
+        html += `<div style="font-size:12px;color:var(--dim);margin:4px 0;font-family:monospace;">${argStr}</div>`;
+      }
+
+      html += `</div>`;
+    });
+  }
+
+  body.innerHTML = html;
+
+  // Update badge
+  const badge = card.querySelector('.node-badge');
+  if (badge) { badge.className = 'node-badge planning'; badge.textContent = '规划'; }
+
+  // Ensure panel is open
+  if (!body.classList.contains('open') && panel.querySelector('.panel-header')) {
+    togglePanel(panel.querySelector('.panel-header'));
+  }
+}
+
+function updateExecutionPanel(card, data) {
+  const panel = card.querySelector('[data-panel="execution"]');
+  if (!panel) return;
+  const body = panel.querySelector('.panel-body');
+
+  let html = '';
+
+  if (data.results && data.results.length) {
+    data.results.forEach((r, i) => {
+      const successIcon = r.success ? '✓' : '✗';
+      const badgeClass = r.success ? 'success' : 'fail';
+      const metaHTML = buildMetaHTML(r.meta);
+
+      html += `<div class="output-item">
+        <div class="output-status">
+          <span class="badge ${badgeClass}">${successIcon} ${escHtml(r.tool || '?')}</span>
+          ${metaHTML}
+          ${r.output_preview ? `<span class="output-toggle" onclick="toggleOutput(this)">[查看输出]</span>` : ''}
+        </div>
+        ${r.output_preview ? `<div class="output-preview-area">${escHtml(r.output_preview)}</div>` : ''}
+      </div>`;
+    });
+  }
+
+  body.innerHTML = html;
+
+  // Update badge
+  const badge = card.querySelector('.node-badge');
+  if (badge) { badge.className = 'node-badge executing'; badge.textContent = '执行'; }
+
+  // Open execution panel
+  if (!body.classList.contains('open') && panel.querySelector('.panel-header')) {
+    togglePanel(panel.querySelector('.panel-header'));
+  }
+}
+
+function updateReflectionPanel(card, data) {
+  const panel = card.querySelector('[data-panel="reflection"]');
+  if (!panel) return;
+  const body = panel.querySelector('.panel-body');
+
+  let html = '';
+
+  // Finding level badge
+  if (data.finding_level) {
+    html += `<span class="badge ${data.finding_level}">${escHtml(data.finding_level)}</span>`;
+  }
+
+  // Summary
+  if (data.summary) {
+    html += `<div class="reflection-summary">${escHtml(data.summary)}</div>`;
+  }
+
+  // Key findings
+  if (data.key_findings && data.key_findings.length) {
+    html += `<div style="margin-top:6px;font-size:12px;color:var(--dim);">关键发现</div>`;
+    data.key_findings.forEach(f => {
+      html += `<div style="font-size:12.5px;margin:3px 0;padding-left:10px;border-left:2px solid var(--border);">${escHtml(f)}</div>`;
+    });
+  }
+
+  // Next direction
+  if (data.next_direction) {
+    html += `<div class="next-direction">📍 下一步：${escHtml(data.next_direction)}</div>`;
+  }
+
+  // Next payloads
+  if (data.next_payloads && data.next_payloads.length) {
+    html += `<div style="margin-top:6px;font-size:12px;color:var(--dim);">建议 payload</div>`;
+    html += `<div class="next-payloads">`;
+    data.next_payloads.slice(0, 5).forEach(p => {
+      html += `<code>${escHtml(p)}</code>`;
+    });
+    html += `</div>`;
+  }
+
+  // Confirmed vulns alert
+  if (data.confirmed_vulns && data.confirmed_vulns.length) {
+    const latestVuln = data.confirmed_vulns[data.confirmed_vulns.length - 1];
+    if (latestVuln) {
+      html += `<div class="vuln-alert">
+        <span>🔓</span>
+        <span class="vuln-type">${escHtml(latestVuln.vuln_type || '未知')}</span>
+        <span class="vuln-proof">${escHtml((latestVuln.proof_brief || '').slice(0, 120))}</span>
+      </div>`;
+    }
+  }
+
+  body.innerHTML = html;
+
+  // Update badge
+  const badge = card.querySelector('.node-badge');
+  if (badge) { badge.className = 'node-badge reflecting'; badge.textContent = '反思'; }
+
+  // Open reflection panel
+  if (!body.classList.contains('open') && panel.querySelector('.panel-header')) {
+    togglePanel(panel.querySelector('.panel-header'));
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// Panel / Output toggle
+// ═══════════════════════════════════════════════════
+
+function togglePanel(header) {
+  const body = header.parentElement.querySelector('.panel-body');
+  const arrow = header.querySelector('.panel-arrow');
+  if (!body) return;
+
+  const isOpen = body.classList.contains('open');
+  body.classList.toggle('open', !isOpen);
+  if (arrow) arrow.classList.toggle('open', !isOpen);
+}
+
+function collapseAllPanels(card) {
+  card.querySelectorAll('.panel-body').forEach(body => body.classList.remove('open'));
+  card.querySelectorAll('.panel-arrow').forEach(arrow => arrow.classList.remove('open'));
+}
+
+function toggleOutput(toggleEl) {
+  const item = toggleEl.closest('.output-item');
+  if (!item) return;
+  const preview = item.querySelector('.output-preview-area');
+  if (!preview) return;
+
+  const isOpen = preview.classList.contains('open');
+  preview.classList.toggle('open', !isOpen);
+  toggleEl.textContent = isOpen ? '[查看输出]' : '[收起输出]';
+}
+
+// ═══════════════════════════════════════════════════
+// Code renderer
+// ═══════════════════════════════════════════════════
+
+function renderCodeBlock(code, id) {
+  const safeId = 'code_' + id;
+  return `<div class="code-block">
+    <button class="code-copy-btn" onclick="copyCode('${safeId}', this)">复制</button>
+    <pre id="${safeId}">${escHtml(code)}</pre>
+  </div>`;
+}
+
+function copyCode(id, btn) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  navigator.clipboard.writeText(el.textContent).then(() => {
+    btn.textContent = '已复制 ✓';
+    setTimeout(() => btn.textContent = '复制', 1500);
+  });
+}
+
+function buildMetaHTML(meta) {
+  if (!meta || !Object.keys(meta).length) return '';
+  let html = '<span class="output-meta-inline">';
+  const parts = [];
+  if (meta.status_code) parts.push(`状态码: ${escHtml(meta.status_code)}`);
+  if (meta.execution_time) parts.push(`耗时: ${escHtml(meta.execution_time)}`);
+  if (meta.resp_len) parts.push(`响应: ${escHtml(meta.resp_len)}B`);
+  if (meta.same_output) parts.push(`<span style="color:var(--yellow);">⚠️ 重复输出</span>`);
+  if (parts.length) html += parts.join(' · ');
+  html += '</span>';
+  return html;
+}
+
+// ═══════════════════════════════════════════════════
+// Markdown renderer
+// ═══════════════════════════════════════════════════
+
+function renderMarkdown(md) {
+  let html = md
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+    return `<pre><code>${escHtml(code.trim())}</code></pre>`;
+  });
+
+  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
+  html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+  html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/^# (.+)$/gm, '<h2>$1</h2>');
+  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>');
+  html = html.replace(/^(?:---|\*\*\*)$/gm, '<hr>');
+  html = html.replace(/^[\-\*] (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/((?:<li>.*<\/li>\n?)+)/g, '<ul>$1</ul>');
+  html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
+  html = html.replace(/^(?!<)(.+)$/gm, '<p>$1</p>');
+  html = html.replace(/<p>\s*<\/p>/g, '');
+
+  return html;
+}
+
+// ═══════════════════════════════════════════════════
+// DOM builders
+// ═══════════════════════════════════════════════════
+
+function appendUserMsg(text) {
+  const d = document.createElement('div');
+  d.className = 'msg user';
+  d.innerHTML = `<div class="avatar">U</div><div class="bubble">${escHtml(text)}</div>`;
+  messages.appendChild(d); scrollBottom();
+}
+
+function appendAgentBubbleForCard() {
+  // Create an agent message container and return the bubble for round cards
+  const d = document.createElement('div');
+  d.className = 'msg agent';
+  d.innerHTML = `<div class="avatar">D</div><div class="bubble"></div>`;
+  messages.appendChild(d); scrollBottom();
+  return d.querySelector('.bubble');
+}
+
+function appendThinkingBubble() {
+  const d = document.createElement('div');
+  d.className = 'msg agent';
+  d.innerHTML = `
+    <div class="avatar">D</div>
+    <div class="bubble">
+      <div class="think-log open"></div>
+      <div class="think-status">
+        <span class="spinner"></span>
+        <span class="status-text">正在思考...</span>
+      </div>
+    </div>`;
+  messages.appendChild(d); scrollBottom();
+  return d.querySelector('.bubble');
+}
+
+function showResultBubble(summary, findings, finalReport) {
+  const content = (finalReport || summary || '').trim();
+
+  if (!content && (!findings || !findings.length)) {
+    if (currentBubble) {
+      currentBubble.innerHTML += '<div style="color:var(--dim);font-size:13px;padding:10px 0;">（任务已完成）</div>';
+    }
+    scrollBottom();
+    return;
+  }
+
+  // Separator
+  if (currentBubble) {
+    const sep = document.createElement('hr');
+    sep.style.cssText = 'border:none;border-top:1px solid var(--border);margin:12px 0;';
+    currentBubble.appendChild(sep);
+  }
+
+  // Render content
+  const resultDiv = document.createElement('div');
+  resultDiv.className = 'md-content';
+
+  if (content) {
+    resultDiv.innerHTML = renderMarkdown(content);
+  } else if (findings && findings.length > 0) {
+    const ul = document.createElement('ul');
+    findings.forEach(f => {
+      const li = document.createElement('li');
+      li.textContent = f;
+      ul.appendChild(li);
+    });
+    resultDiv.appendChild(ul);
+  }
+
+  // Copy button
+  if (content && currentBubble) {
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'copy-btn';
+    copyBtn.textContent = '复制';
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(content).then(() => {
+        copyBtn.textContent = '已复制 ✓';
+        setTimeout(() => copyBtn.textContent = '复制', 1500);
+      });
+    });
+    currentBubble.appendChild(copyBtn);
+  }
+
+  if (currentBubble) {
+    currentBubble.appendChild(resultDiv);
+  }
+  scrollBottom();
+}
+
+function appendResultBubble(summary, findings) {
+  const d = document.createElement('div');
+  d.className = 'msg agent';
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  d.innerHTML = '<div class="avatar">D</div>';
+  d.appendChild(bubble);
+  messages.appendChild(d);
+  currentBubble = bubble;
+  showResultBubble(summary, findings, '');
+  currentBubble = null;
+}
+
+// ═══════════════════════════════════════════════════
+// Utils
+// ═══════════════════════════════════════════════════
+
+function escHtml(s) {
+  if (s == null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function scrollBottom() { messages.scrollTop = messages.scrollHeight; }
+
+function updateMemoryDisp() {
+  if (memoryCount > 0) {
+    memoryDisp.textContent = `📝 会话记忆 ${memoryCount} 轮`;
+    memoryDisp.title = '点击清除会话记忆（不影响侧栏历史）';
+  } else {
+    memoryDisp.textContent = '';
+  }
+}
+
+function clearMemory() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'clear_memory' }));
+}
+
+function autoResize() {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 140) + 'px';
+}
+
+input.addEventListener('input', autoResize);
+input.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
+sendBtn.addEventListener('click', send);
+stopBtn.addEventListener('click', () => {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'interrupt' }));
+  stopBtn.textContent = '■ 打断中...';
+  stopBtn.style.opacity = '0.6';
+  setTimeout(() => { stopBtn.textContent = '■ 打断'; stopBtn.style.opacity = ''; }, 2000);
+});
+function fillExample(el) { input.value = el.textContent; input.focus(); autoResize(); }
+
+// Init
+renderSidebar();
+</script>
+</body>
+</html>
