@@ -1,0 +1,11 @@
+# deepagent specific ignore patterns
+__pycache__/
+*.pyc
+.chromadb/
+data/
+reference/PayloadsAllTheThings/
+reference/HowToHunt/
+reference/hacktricks/
+reference/wstg/
+reference/nuclei-templates/
+reference/Dictionary/
