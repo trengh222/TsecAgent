@@ -126,12 +126,22 @@ async def _check_llm(llm) -> CheckResult:
     try:
         resp = await asyncio.wait_for(
             llm.ainvoke("Reply with one word: OK"),
-            timeout=20,
+            timeout=60,
         )
-        content = (resp.content if hasattr(resp, "content") else str(resp)).strip()[:40]
+        # 兼容新版本返回 dict 和旧版本返回 AIMessage
+        if isinstance(resp, dict):
+            content = resp.get("content", str(resp))
+        else:
+            content = resp.content if hasattr(resp, "content") else str(resp)
+        # content 可能是 list[dict]（Anthropic API 返回格式）
+        if isinstance(content, list):
+            content = " ".join(
+                item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"
+            ) or str(content)
+        content = str(content).strip()[:40]
         return CheckResult(_Status.OK, "LLM", content, time.monotonic() - t, critical=True)
     except asyncio.TimeoutError:
-        return CheckResult(_Status.FAIL, "LLM", "请求超时（>20s），检查 ANTHROPIC_BASE_URL / 网络", time.monotonic() - t, critical=True)
+        return CheckResult(_Status.FAIL, "LLM", "请求超时（>60s），检查 ANTHROPIC_BASE_URL / 网络", time.monotonic() - t, critical=True)
     except Exception as e:
         return CheckResult(_Status.FAIL, "LLM", str(e)[:70], time.monotonic() - t, critical=True)
 
