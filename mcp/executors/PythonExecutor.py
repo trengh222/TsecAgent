@@ -54,7 +54,7 @@ _PENTEST_MODULES: Set[str] = {
 
     # 密码学与编码
     "hashlib", "base64", "binascii", "cryptography", "Crypto",
-    "hmac", "secrets", "random",
+    "hmac", "secrets", "random", "time", "datetime",
 
     # 数据处理
     "json", "xml", "yaml", "csv", "re", "struct",

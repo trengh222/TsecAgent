@@ -436,47 +436,51 @@
      Markdown rendered output
      ═══════════════════════════════════════ */
 
-  .md-content {
-    font-size: 14px;
-    line-height: 1.8;
+  /* ═══════════════════════════════════════
+     Final report - compact layout
+     ═══════════════════════════════════════ */
+
+  .md-content.report-compact {
+    font-size: 13px;
+    line-height: 1.5;
     color: var(--text);
     white-space: pre-wrap;
     word-break: break-word;
   }
-  .md-content h2, .md-content .md-h2 {
-    font-size: 17px; font-weight: 600; color: var(--text);
-    margin: 20px 0 8px; padding-bottom: 4px;
+  .md-content.report-compact h2, .md-content.report-compact .md-h2 {
+    font-size: 14.5px; font-weight: 600; color: var(--text);
+    margin: 12px 0 4px; padding-bottom: 3px;
     border-bottom: 1px solid var(--border);
   }
-  .md-content h3, .md-content .md-h3 {
-    font-size: 15px; font-weight: 600; color: var(--text);
-    margin: 14px 0 6px;
+  .md-content.report-compact h3, .md-content.report-compact .md-h3 {
+    font-size: 13.5px; font-weight: 600; color: var(--text);
+    margin: 8px 0 3px;
   }
-  .md-content h4, .md-content .md-h4 {
-    font-size: 14px; font-weight: 600; color: var(--text);
-    margin: 12px 0 4px;
+  .md-content.report-compact h4, .md-content.report-compact .md-h4 {
+    font-size: 13px; font-weight: 600; color: var(--text);
+    margin: 6px 0 2px;
   }
-  .md-content p, .md-content .md-p { margin: 6px 0; }
-  .md-content ul, .md-content .md-ul {
-    padding-left: 24px; margin: 6px 0; list-style-type: disc;
+  .md-content.report-compact p, .md-content.report-compact .md-p { margin: 3px 0; }
+  .md-content.report-compact ul, .md-content.report-compact .md-ul {
+    padding-left: 18px; margin: 3px 0; list-style-type: disc;
   }
-  .md-content li, .md-content .md-li { margin: 3px 0; line-height: 1.6; }
-  .md-content pre {
+  .md-content.report-compact li, .md-content.report-compact .md-li { margin: 1px 0; line-height: 1.45; }
+  .md-content.report-compact pre {
     background: var(--bg); border: 1px solid var(--border);
-    border-radius: 6px; padding: 12px; margin: 10px 0;
+    border-radius: 4px; padding: 8px 10px; margin: 6px 0;
     overflow-x: auto; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-    font-size: 12.5px; line-height: 1.6;
+    font-size: 11.5px; line-height: 1.4;
   }
-  .md-content code {
+  .md-content.report-compact code {
     background: var(--bg2); border-radius: 3px;
-    padding: 1px 5px; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
-    font-size: 12.5px;
+    padding: 1px 4px; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+    font-size: 11.5px;
   }
-  .md-content pre code { background: none; padding: 0; }
-  .md-content hr, .md-content .md-hr {
-    border: none; border-top: 1px solid var(--border); margin: 16px 0;
+  .md-content.report-compact pre code { background: none; padding: 0; }
+  .md-content.report-compact hr, .md-content.report-compact .md-hr {
+    border: none; border-top: 1px solid var(--border); margin: 10px 0;
   }
-  .md-content strong { color: var(--text); font-weight: 600; }
+  .md-content.report-compact strong { color: var(--text); font-weight: 600; }
 
   .copy-btn {
     margin-top: 10px;
@@ -903,8 +907,14 @@ function handleMessage(data) {
     }
 
     case 'done': {
-      // Collapse all round cards
+      // Expand all panels in the last round card so user can see execution & reflection output
+      if (currentRoundCard) {
+        currentRoundCard.querySelectorAll('.panel-body').forEach(body => body.classList.add('open'));
+        currentRoundCard.querySelectorAll('.panel-arrow').forEach(arrow => arrow.classList.add('open'));
+      }
+      // Collapse older round cards
       document.querySelectorAll('.round-card').forEach(card => {
+        if (card === currentRoundCard) return;
         collapseAllPanels(card);
       });
       // Show final report
@@ -988,11 +998,11 @@ function createRoundCard(round, vulnFocus) {
     </div>
     <div class="panel" data-panel="execution">
       <div class="panel-header" onclick="togglePanel(this)">
-        <span class="panel-arrow">▶</span>
+        <span class="panel-arrow open">▼</span>
         <span class="panel-icon">⚡</span>
         <span class="panel-label">执行</span>
       </div>
-      <div class="panel-body"></div>
+      <div class="panel-body open"><div class="agent-thinking"><div class="spinner"></div><span>任务执行中，请稍候...</span></div></div>
     </div>
     <div class="panel" data-panel="reflection">
       <div class="panel-header" onclick="togglePanel(this)">
@@ -1307,13 +1317,13 @@ function showResultBubble(summary, findings, finalReport) {
   // Separator
   if (currentBubble) {
     const sep = document.createElement('hr');
-    sep.style.cssText = 'border:none;border-top:1px solid var(--border);margin:12px 0;';
+    sep.style.cssText = 'border:none;border-top:1px solid var(--border);margin:10px 0;';
     currentBubble.appendChild(sep);
   }
 
-  // Render content
+  // Render content - use compact class for final reports
   const resultDiv = document.createElement('div');
-  resultDiv.className = 'md-content';
+  resultDiv.className = 'md-content' + (finalReport ? ' report-compact' : '');
 
   if (content) {
     resultDiv.innerHTML = renderMarkdown(content);
