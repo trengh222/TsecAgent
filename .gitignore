@@ -1,6 +1,10 @@
-# deepagent specific ignore patterns
+# macOS
+.DS_Store
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
 .chromadb/
 data/
 reference/PayloadsAllTheThings/
