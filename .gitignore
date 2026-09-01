@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Secrets
+.env
+
+# IDE / internal
+.trae/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.chromadb/
+data/
+
+# 第三方大体积知识库（数百MB，clone 后按需自行下载，不入库）
+langGraph/deepagent/knowledge/reference/PayloadsAllTheThings/
+langGraph/deepagent/knowledge/reference/HowToHunt/
+langGraph/deepagent/knowledge/reference/hacktricks/
+langGraph/deepagent/knowledge/reference/wstg/
+langGraph/deepagent/knowledge/reference/nuclei-templates/
+langGraph/deepagent/knowledge/reference/Dictionary/
