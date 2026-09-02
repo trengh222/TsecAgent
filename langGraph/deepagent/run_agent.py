@@ -23,6 +23,11 @@ import platform
 import sys
 import time
 
+# Windows GBK 控制台兼容：健康检查输出含 ✓/✗ 等符号，强制 UTF-8 输出避免 UnicodeEncodeError
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # 将 deepagent 的父目录（langGraph/）加入 sys.path，使 `import deepagent` 可用
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 

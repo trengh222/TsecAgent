@@ -46,6 +46,29 @@ class PlannerContext(BaseModel):
     # 目标分析：根据 URL 特征筛选出的适用方向（为空表示全部方向适用）
     applicable_directions: Optional[List[str]] = None
 
+    # ── 计划驱动流程 ──────────────────────────────────────────────
+    # 首轮规划确定的总思考轮数（后续轮次按此推进，末轮自动收尾总结）
+    total_rounds: Optional[int] = None
+    # 测试文档：首轮生成，中间轮修订增补（directions[].cases[].status: pending/done/found/failed）
+    test_plan: Optional[Dict[str, Any]] = None
+    # 利用链进度：跨轮要素沉淀（源码片段/关键接口/序列化点/绕过的正则等），
+    # 注入 Planner 提示词让多步利用的下一跳基于已有要素，而非从头重新探测
+    chain_notes: List[str] = Field(default_factory=list)
+
+    # ── 组合利用工作记忆（多漏洞联动核心）─────────────────────
+    # 攻击资产面板：跨轮累积的结构化资产——已到手的"牌"
+    # 每项: {"kind": endpoint|param|source-code|credential|cookie|filter-rule|
+    #         injection-primitive|file-read-primitive|rce-primitive|other,
+    #        "desc": 一句话描述, "evidence": 原文证据片段, "round": 轮次}
+    assets: List[Dict[str, Any]] = Field(default_factory=list)
+    # 未破门槛：阻碍利用链推进的关卡（过滤规则/权限限制/二次校验等），
+    # Planner 每轮必须为每个门槛安排突破尝试任务
+    # 每项: {"desc": 一句话描述, "evidence": 原文证据, "round": 轮次}
+    blockers: List[Dict[str, Any]] = Field(default_factory=list)
+    # 证据原文库：服务端自动从每轮执行结果提取的高价值证据原文（防摘要丢细节）
+    # 每项: {"id": 递增编号, "kind": 证据类型, "content": 原文摘录, "round": 轮次}
+    evidence_vault: List[Dict[str, Any]] = Field(default_factory=list)
+
 
 class ReflectorContext(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)

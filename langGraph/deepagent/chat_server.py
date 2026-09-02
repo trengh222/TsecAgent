@@ -25,6 +25,8 @@ from typing import Any, Dict, Optional
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
+# Windows 控制台默认 GBK，structlog 输出 emoji/特殊符号会 UnicodeEncodeError，
+# 导致 agent 节点崩溃。方案：配置 structlog 同时写文件（UTF-8）和控制台（replace 容错）。
 try:
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).parent / ".env", override=True)
@@ -49,8 +51,80 @@ _config: Optional[Dict[str, Any]] = None
 # ── 会话记忆：session_id -> 对话历史列表 [{"goal", "summary", "findings"}]
 _session_memory: Dict[str, list] = {}
 
+# ── 会话记忆磁盘持久化：服务重启后仍能恢复"同窗口对话的记忆"──────────────
+_CHAT_STATE_DIR = Path(__file__).parent / ".chat_state"
+_SESSION_MEMORY_FILE = _CHAT_STATE_DIR / "session_memory.json"
+
+
+def _load_session_memory() -> None:
+    """启动时从磁盘恢复会话记忆（服务重启/崩溃后继续可用）。"""
+    try:
+        if _SESSION_MEMORY_FILE.exists():
+            data = json.loads(_SESSION_MEMORY_FILE.read_text(encoding="utf-8"))
+            for k, v in (data or {}).items():
+                if isinstance(v, list):
+                    _session_memory[str(k)] = [t for t in v if isinstance(t, dict)][-10:]
+    except Exception as e:
+        logger.warning("session_memory_load_failed", error=str(e))
+
+
+def _save_session_memory() -> None:
+    try:
+        _CHAT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        _SESSION_MEMORY_FILE.write_text(
+            json.dumps(_session_memory, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning("session_memory_save_failed", error=str(e))
+
+
+def _append_session_memory(session_id: str, goal: str, summary: str, findings: list) -> None:
+    """任务完成后记账：写入内存 + 磁盘，供同会话的下一轮提问携带记忆。"""
+    mem = _session_memory.setdefault(session_id, [])
+    mem.append({
+        "goal": goal,
+        "summary": summary or f"（第 {len(mem) + 1} 轮任务已完成）",
+        "findings": findings,
+    })
+    # 最多保留最近 10 轮
+    if len(mem) > 10:
+        _session_memory[session_id] = mem[-10:]
+    _save_session_memory()
+
+
+_load_session_memory()
+
 # ── 正在运行的任务：session_id -> asyncio.Task（用于打断）
 _running_tasks: Dict[str, asyncio.Task] = {}
+
+# ── 协作式停止标志：session_id -> asyncio.Event（打断时置位，_run_agent 在
+#    每个流事件处检查并主动退出，配合 task.cancel() 双保险）
+_session_stops: Dict[str, asyncio.Event] = {}
+
+# ── 会话级事件广播（解决"刷新后任务进度丢失/重连后卡住"）───────────────────
+#   _session_events: session_id -> 累积的进度事件列表（start/progress/test_plan/done）
+#   _session_subs:   session_id -> set[WebSocket]（该会话当前所有活跃连接）
+# 设计：agent 进度事件广播到会话的所有连接并写入缓冲；新连接建立时回放缓冲，
+#       WebSocket 断开不再 cancel 任务，任务继续跑完、结果留痕。
+_session_events: Dict[str, list] = {}
+_session_subs: Dict[str, set] = {}
+
+_EVENT_HISTORY_MAX = 600  # 历史事件上限，超出滚动保留（防止长任务内存膨胀）
+
+
+async def _broadcast(session_id: str, event: dict) -> None:
+    """将事件广播给该会话所有活跃连接，并写入 session 级缓冲供新连接回放。"""
+    payload = json.dumps(event, ensure_ascii=False)
+    buf = _session_events.setdefault(session_id, [])
+    buf.append(event)
+    if len(buf) > _EVENT_HISTORY_MAX:
+        _session_events[session_id] = buf[-_EVENT_HISTORY_MAX // 2:]
+
+    for ws in list(_session_subs.get(session_id, ())):
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            _session_subs.get(session_id, set()).discard(ws)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -58,18 +132,43 @@ _running_tasks: Dict[str, asyncio.Task] = {}
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _build_llm():
-    from langchain_anthropic import ChatAnthropic
+    """从环境变量构建 LangChain Chat 模型（按 LLM_PROVIDER 选 Anthropic / OpenAI 兼容）。
 
+    与 run_agent.py 的 _build_llm 保持一致：
+      Provider → LLM_PROVIDER（默认 anthropic；openai 覆盖所有 OpenAI 兼容端点）
+      API Key  → LLM_API_KEY > ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN
+      Base URL → LLM_BASE_URL > ANTHROPIC_BASE_URL（支持中转代理）
+    """
     def _clean(val: str) -> str:
         return (val or "").strip().strip("'\"")
 
-    api_key  = _clean(os.getenv("ANTHROPIC_API_KEY", "")) or _clean(os.getenv("ANTHROPIC_AUTH_TOKEN", ""))
-    base_url = _clean(os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")) or "https://api.anthropic.com"
-    model    = os.getenv("LLM_MODEL", "claude-sonnet-4-6")
-    temp     = float(os.getenv("LLM_TEMPERATURE", "0.7"))
-    max_tok  = int(os.getenv("LLM_MAX_TOKENS", "25000"))
-    streaming = os.getenv("LLM_STREAMING", "false").lower() in ("1", "true", "yes")
+    provider  = (_clean(os.getenv("LLM_PROVIDER", "anthropic")) or "anthropic").lower()
+    api_key   = _clean(os.getenv("LLM_API_KEY", "")) or _clean(os.getenv("ANTHROPIC_API_KEY", "")) or _clean(os.getenv("ANTHROPIC_AUTH_TOKEN", ""))
+    base_url  = _clean(os.getenv("LLM_BASE_URL", "")) or _clean(os.getenv("ANTHROPIC_BASE_URL", ""))
+    model     = os.getenv("LLM_MODEL",       "claude-sonnet-4-6")
+    temp      = float(os.getenv("LLM_TEMPERATURE", "0.7"))
+    max_tok   = int(os.getenv("LLM_MAX_TOKENS",    "25000"))
+    streaming = os.getenv("LLM_STREAMING", "true").lower() in ("1", "true", "yes")
 
+    if provider == "openai":
+        # OpenAI 兼容端点：OpenAI 本家 + DeepSeek/Qwen/GLM/Kimi/Yi/MiniMax/Doubao/Baichuan/Gemini/xAI
+        from langchain_openai import ChatOpenAI
+        if not base_url:
+            base_url = "https://api.openai.com/v1"
+        return ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=temp,
+            max_tokens=max_tok,
+            streaming=streaming,
+            timeout=120,
+        )
+
+    # 默认 anthropic（原生 Anthropic SDK）
+    from langchain_anthropic import ChatAnthropic
+    if not base_url:
+        base_url = "https://api.anthropic.com"
     return ChatAnthropic(
         model=model,
         anthropic_api_key=api_key,
@@ -189,12 +288,26 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
     await websocket.accept()
     logger.info("ws_connected", session_id=session_id)
 
+    # 会话级广播：agent 进度事件发到该会话所有连接，并写入缓冲
     async def send(data: dict):
-        try:
-            await websocket.send_text(json.dumps(data, ensure_ascii=False))
-        except Exception as e:
-            logger.error("websocket_send_failed", session_id=session_id, error=str(e))
-            raise
+        await _broadcast(session_id, data)
+
+    # ── 连接建立：先告知前端本会话是否有事件缓冲，再回放历史 ────────────
+    #   has_history=true  → 前端清空界面，等待随后回放的事件重建（运行中刷新场景）
+    #   has_history=false → 服务重启、无缓冲，前端回退到本地 localStorage 快照
+    history_buf = _session_events.get(session_id, [])
+    try:
+        await websocket.send_text(json.dumps(
+            {"type": "session_state", "has_history": bool(history_buf)}, ensure_ascii=False
+        ))
+        for ev in history_buf:
+            await websocket.send_text(json.dumps(ev, ensure_ascii=False))
+    except Exception:
+        # 回放过程中连接断开则直接结束
+        return
+
+    # 回放完成后加入订阅者，开始接收实时广播
+    _session_subs.setdefault(session_id, set()).add(websocket)
 
     try:
         while True:
@@ -205,12 +318,29 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 await send({"type": "error", "message": "消息格式错误（需 JSON）"})
                 continue
 
+            # ── 心跳保活：pong 只回给当前连接，不广播、不缓冲 ──────
+            if msg.get("type") == "ping":
+                try:
+                    await websocket.send_text(json.dumps({"type": "pong"}, ensure_ascii=False))
+                except Exception:
+                    break
+                continue
+
             # ── 打断请求 ──────────────────────────────────────
             if msg.get("type") == "interrupt":
                 task = _running_tasks.get(session_id)
                 if task and not task.done():
+                    # 双保险：协作式停止标志（让 astream 循环主动退出）+ 强制 cancel
+                    stop = _session_stops.get(session_id)
+                    if stop:
+                        stop.set()
                     task.cancel()
                     logger.info("task_interrupted", session_id=session_id)
+                    # 最多等 2 秒确认任务退出，避免 interrupted 之后旧任务事件继续涌入
+                    for _ in range(20):
+                        if task.done():
+                            break
+                        await asyncio.sleep(0.1)
                     await send({"type": "interrupted", "message": "已打断"})
                 else:
                     await send({"type": "interrupted", "message": "无正在运行的任务"})
@@ -227,6 +357,13 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 await send({"type": "error", "message": "目标不能为空"})
                 continue
 
+            # 防并发：同会话同时只允许一个 agent 任务，避免两个任务共享 executor
+            # 交叉污染、事件混流（旧 bug：打断失效时旧任务继续跑 + 新任务并发）
+            _prev = _running_tasks.get(session_id)
+            if _prev and not _prev.done():
+                await send({"type": "error", "message": "已有任务在运行中，请先打断或等待完成"})
+                continue
+
             thread_id = (msg.get("thread_id") or "").strip() or session_id
             max_iter  = min(int(msg.get("max_iterations", 10)), 50)  # Increased max iterations
 
@@ -234,47 +371,39 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
             history = _session_memory.get(session_id, [])
             enriched_goal = _build_goal_with_memory(goal, history)
 
+            # 新任务开始：清空本会话事件缓冲，避免刷新重连回放时旧任务的
+            # progress/done 事件混入新任务流（→ 前端旧轮卡片与新卡片交错、
+            # 两份总结报告）。任务互斥已保证此刻无旧任务在跑。
+            _session_events[session_id] = []
             logger.info("task_start", session_id=session_id, goal=goal[:80])
             await send({"type": "start", "goal": goal})
 
-            # 在独立 Task 中运行 agent，以便打断
+            # 在独立 Task 中运行 agent；主循环【不 await】——继续处理 receive，
+            # 打断/新消息可即时响应（旧实现阻塞在 await agent_task 上，interrupt
+            # 消息排队到任务结束才被处理，打断形同虚设）
+            stop = asyncio.Event()
+            _session_stops[session_id] = stop
             agent_task = asyncio.ensure_future(
-                _run_agent(session_id, enriched_goal, thread_id, max_iter, send)
+                _run_agent(session_id, goal, enriched_goal, thread_id, max_iter, send, stop)
             )
             _running_tasks[session_id] = agent_task
 
-            try:
-                summary, findings = await agent_task
-                # 保存到会话记忆（无论 summary 是否为空，都保存以保证记忆连贯性）
-                mem = _session_memory.setdefault(session_id, [])
-                mem.append({
-                    "goal": goal,
-                    "summary": summary or f"（第 {len(mem)+1} 轮任务已完成）",
-                    "findings": findings,
-                })
-                # 最多保留最近 10 轮
-                if len(mem) > 10:
-                    _session_memory[session_id] = mem[-10:]
-            except asyncio.CancelledError:
-                # 打断：interrupted 消息已由 interrupt 处理块发送，这里不重复发 done
-                logger.info("task_cancelled", session_id=session_id)
-            except Exception as e:
-                logger.error("task_error", session_id=session_id, error=str(e))
-                await send({"type": "error", "message": str(e)})
-            finally:
-                _running_tasks.pop(session_id, None)
+            def _on_agent_done(t: asyncio.Task, sid: str = session_id):
+                _running_tasks.pop(sid, None)
+                _session_stops.pop(sid, None)
+                # 取出异常避免 "exception was never retrieved"（内部已处理并广播 error）
+                if not t.cancelled() and t.exception():
+                    logger.error("agent_task_crashed", session_id=sid,
+                                 error=str(t.exception()))
+            agent_task.add_done_callback(_on_agent_done)
 
     except WebSocketDisconnect:
         logger.info("ws_disconnected", session_id=session_id)
-        task = _running_tasks.pop(session_id, None)
-        if task and not task.done():
-            task.cancel()
     except Exception as e:
         logger.error("ws_error", session_id=session_id, error=str(e))
-        try:
-            await send({"type": "error", "message": str(e)})
-        except Exception:
-            pass
+    finally:
+        # 连接断开仅移除订阅，不取消运行中的任务（任务继续跑完，结果缓冲供新连接回放）
+        _session_subs.get(session_id, set()).discard(websocket)
 
 
 def _build_goal_with_memory(goal: str, history: list) -> str:
@@ -294,22 +423,42 @@ def _build_goal_with_memory(goal: str, history: list) -> str:
 
 async def _run_agent(
     session_id: str,
+    clean_goal: str,
     enriched_goal: str,
     thread_id: str,
     max_iter: int,
     send,
+    stop: asyncio.Event,
 ) -> tuple[str, list]:
-    """执行 agent 流，流式推送进度，返回 (summary, findings)。"""
+    """执行 agent 流，流式推送进度，返回 (summary, findings)。
+
+    clean_goal   用户本轮原始目标（写会话记忆用，不含历史前缀）；
+    enriched_goal 拼接了会话历史的完整目标（喂给 agent 图用）；
+    stop         协作式停止标志——打断时置位，本函数在每个流事件处
+                 检查并主动退出（不发送 done，interrupted 由打断方发送）。
+    """
     agent = _make_agent(max_iterations=max_iter)
     last_summary = ""
     last_key_findings: list = []
     last_final_report: str | None = None
     last_state = None
+    interrupted = False
 
     try:
         async for event in agent.stream(enriched_goal, thread_id=thread_id):
+            if stop.is_set():
+                interrupted = True
+                logger.info("agent_stopped_by_flag", session_id=session_id)
+                break
             for node_name, state in event.items():
                 last_state = state
+                # 总结报告：在 summarizer 事件里直接捕获，不依赖"最后一个事件"
+                # （LangGraph 部分版本不产出末端节点事件，仅靠 last_state 会丢报告）
+                if node_name == "summarizer":
+                    _fr = _sget(state, "final_report", None)
+                    if _fr:
+                        last_final_report = _fr
+
                 round_   = _sget(state, "execution_round", 0)
                 tasks    = _extract_tasks(state)
                 results  = _extract_results(state)
@@ -347,11 +496,45 @@ async def _run_agent(
                     "confirmed_vulns":  confirmed_vulns,
                 })
 
+                # 测试文档推送：planner 生成/修订 test_plan 后单独发事件供前端展示
+                # （首轮为完整文档；中间轮为修订版，前端原地更新同一卡片）
+                if node_name == "planner":
+                    tp_raw = planner_raw
+                    tp_dict = None
+                    total_rounds = None
+                    if tp_raw:
+                        if isinstance(tp_raw, dict):
+                            tp_dict = tp_raw.get("test_plan")
+                            total_rounds = tp_raw.get("total_rounds")
+                        else:
+                            tp_dict = getattr(tp_raw, "test_plan", None)
+                            total_rounds = getattr(tp_raw, "total_rounds", None)
+                    if isinstance(tp_dict, dict) and tp_dict.get("directions"):
+                        await send({
+                            "type":         "test_plan",
+                            "round":        round_,
+                            "total_rounds": total_rounds,
+                            "plan":         tp_dict,
+                        })
+
+        # 打断（协作式退出）：不发 done（interrupted 已由打断方发送）、不写记忆
+        if interrupted:
+            return last_summary, last_key_findings
+
         if not last_summary and last_state is not None:
             last_summary = _extract_last_ai_message(last_state)
 
-        if last_state is not None:
-            last_final_report = _sget(last_state, "final_report", None)
+        # 兜底：从 checkpointer 直接取最终状态（应对末端节点事件缺失/状态回环等边界）
+        if not last_final_report:
+            try:
+                snap = agent.graph.app.get_state({"configurable": {"thread_id": thread_id}})
+                if snap and snap.values:
+                    _v = snap.values
+                    _fr = _v.get("final_report") if isinstance(_v, dict) else getattr(_v, "final_report", None)
+                    if _fr:
+                        last_final_report = _fr
+            except Exception as e:
+                logger.warning("final_report_get_state_failed", error=str(e))
 
         await send({
             "type":         "done",
@@ -359,14 +542,28 @@ async def _run_agent(
             "key_findings": last_key_findings,
             "final_report": last_final_report,
         })
-        logger.info("task_done", session_id=session_id)
+
+        # 会话记忆：任务真正完成后立即记账（写在 _run_agent 内，WebSocket 断开也不丢）
+        _append_session_memory(session_id, clean_goal, last_summary, last_key_findings)
+
+        logger.info("task_done", session_id=session_id,
+                    report_len=len(last_final_report or ""))
         return last_summary, last_key_findings
+    except asyncio.CancelledError:
+        # 强制 cancel（打断的第二层保险）：不发 done、不写记忆，由打断方发 interrupted
+        logger.info("agent_task_cancelled", session_id=session_id)
+        raise
     except Exception as e:
-        logger.error("agent_stream_error", session_id=session_id, error=str(e))
-        await send({
-            "type": "error",
-            "message": f"Agent执行错误: {str(e)}"
-        })
+        _err = str(e)
+        # WebSocket 断开导致的异常不向前端报错（连接已断，报了也收不到）
+        if "websocket" in _err.lower() or "asgi" in _err.lower():
+            logger.warning("agent_stream_ws_disconnected", session_id=session_id, error=_err[:100])
+        else:
+            logger.error("agent_stream_error", session_id=session_id, error=_err)
+            await send({
+                "type": "error",
+                "message": f"Agent执行错误: {_err}"
+            })
         return "", []
 
 
@@ -548,14 +745,33 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true", help="调试模式（热重载）")
     args = parser.parse_args()
 
+    # 日志双输出：控制台（容错编码）+ 文件（UTF-8 完整保留，供诊断）
+    _log_dir = Path(__file__).parent / ".logs"
+    _log_dir.mkdir(parents=True, exist_ok=True)
+    _log_file = _log_dir / "chat_server.log"
+    _log_handler_file = _logging.FileHandler(_log_file, encoding="utf-8")
+    _log_handler_file.setFormatter(_logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    _log_handler_console = _logging.StreamHandler()
+    _log_handler_console.setFormatter(_logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    # 控制台在 Windows GBK 下用 replace 容错，避免 UnicodeEncodeError 崩溃整个 agent
+    if sys.platform == "win32":
+        _log_handler_console.setStream(open(sys.stderr.fileno(), mode="w", encoding="utf-8", errors="replace", closefd=False))
+
+    _root_logger = _logging.getLogger()
+    _root_logger.handlers.clear()
+    _root_logger.addHandler(_log_handler_file)
+    _root_logger.addHandler(_log_handler_console)
+    _root_logger.setLevel(_logging.DEBUG if args.debug else _logging.INFO)
+
     structlog.configure(
         processors=[
             structlog.stdlib.add_log_level,
             structlog.processors.TimeStamper(fmt="%H:%M:%S"),
-            structlog.dev.ConsoleRenderer(colors=True),
+            structlog.dev.ConsoleRenderer(colors=False),
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
-        wrapper_class=structlog.stdlib.BoundLogger,
         logger_factory=structlog.stdlib.LoggerFactory(),
+        wrapper_class=structlog.stdlib.BoundLogger,
         cache_logger_on_first_use=True,
     )
 

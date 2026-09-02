@@ -116,7 +116,11 @@ class DeepAgent:
         Yields:
             LangGraph 事件字典 {"node_name": state}
         """
-        config = {"configurable": {"thread_id": thread_id}}
+        # PER 循环每轮消耗 3 步，LangGraph 默认 recursion_limit=25 只够约 8 轮，需按 max_iterations 放大
+        config = {
+            "configurable": {"thread_id": thread_id},
+            "recursion_limit": max(40, self.max_iterations * 3 + 15),
+        }
         initial_state = DeepAgentState(
             current_goal=goal,
             messages=[{"role": "user", "content": goal}],

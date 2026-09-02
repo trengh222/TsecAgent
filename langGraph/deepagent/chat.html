@@ -626,13 +626,28 @@
 // localStorage
 // ═══════════════════════════════════════════════════
 
-const STORE_KEY = 'deepagent_sessions';
+const STORE_KEY  = 'deepagent_sessions';
+const ACTIVE_KEY = 'deepagent_active_sid';
 
 function loadSessions() {
   try { return JSON.parse(localStorage.getItem(STORE_KEY) || '[]'); }
   catch { return []; }
 }
-function persistSessions(arr) { localStorage.setItem(STORE_KEY, JSON.stringify(arr)); }
+function persistSessions(arr) {
+  // localStorage 有 5MB 上限；保存前做一次防御性裁剪，防止单会话 HTML 过大导致写失败
+  try { localStorage.setItem(STORE_KEY, JSON.stringify(arr)); }
+  catch (e) {
+    // 写满时：从最旧的非置顶会话开始剔除 HTML 快照（保留 turns 摘要与标题）
+    const reduced = arr.map(s => ({ ...s }));
+    for (const s of reduced) {
+      if (s.pinned) continue;
+      if (s.html) { s.html = ''; break; }
+    }
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(reduced)); }
+    catch { /* 最终失败则放弃写入，不影响运行 */ }
+  }
+}
+function setActiveSid(sid) { try { localStorage.setItem(ACTIVE_KEY, sid || ''); } catch {} }
 
 function saveTurn(sid, goal, summary, findings) {
   const sessions = loadSessions();
@@ -646,6 +661,37 @@ function saveTurn(sid, goal, summary, findings) {
   }
   persistSessions(sessions);
   renderSidebar();
+}
+
+// 保存完整对话画面（含每轮规划/执行/反思卡片），用于刷新/重开后完整恢复
+function snapshotHtml(sid) {
+  if (!sid || !messages) return;
+  const sessions = loadSessions();
+  const idx = sessions.findIndex(s => s.id === sid);
+  if (idx < 0) return;
+  sessions[idx].html = messages.innerHTML;
+  sessions[idx].updatedAt = Date.now();
+  persistSessions(sessions);
+}
+
+// 确保会话条目存在（send 时立即调用，避免运行中刷新找不到会话导致"正在运行的任务消失"）
+function ensureSession(sid, goal) {
+  if (!sid) return;
+  const sessions = loadSessions();
+  if (sessions.find(s => s.id === sid)) return;
+  sessions.unshift({ id: sid, title: String(goal || '').slice(0, 60), createdAt: Date.now(), updatedAt: Date.now(), turns: [] });
+  persistSessions(sessions);
+  renderSidebar();
+}
+
+// 节流快照：运行中每 2 秒最多落盘一次，刷新后能保留已完成的轮次卡片
+let _snapTimer = null;
+function scheduleSnapshot() {
+  if (_snapTimer || !currentSid) return;
+  _snapTimer = setTimeout(() => {
+    _snapTimer = null;
+    snapshotHtml(currentSid);
+  }, 2000);
 }
 
 function fmtTime(ts) {
@@ -744,7 +790,7 @@ function deleteSession(sid) {
 // State
 // ═══════════════════════════════════════════════════
 
-let currentSid    = 'sess_' + Math.random().toString(36).slice(2, 10);
+let currentSid    = null;   // 初始为 null，由 bootstrap() 决定复用上个会话还是新建
 let ws            = null;
 let isBusy        = false;
 let currentBubble = null;
@@ -753,8 +799,10 @@ let lastGoal      = '';
 let lastSummary   = '';
 let lastFindings  = [];
 let _reconnect    = true;
+let _wsGen        = 0;    // 连接代次：旧连接 onclose 时若代次已变更则不重连，防止双连接重复渲染
 let memoryCount   = 0;
 let currentRoundCard = null;  // current active round card element
+let _pendingSid   = null;     // 待本地快照恢复的会话 id（openSession 时设置，session_state 消费）
 
 const statusDot  = document.getElementById('statusDot');
 const sendBtn    = document.getElementById('sendBtn');
@@ -771,13 +819,32 @@ const newChatBtn = document.getElementById('newChatBtn');
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws/${currentSid}`);
-  ws.onopen    = () => { setStatus('ready'); sendBtn.disabled = false; _reconnect = true; };
-  ws.onclose   = () => { setStatus('error'); sendBtn.disabled = true; if (_reconnect) setTimeout(connect, 3000); };
-  ws.onerror   = () => setStatus('error');
-  ws.onmessage = e => handleMessage(JSON.parse(e.data));
+  const gen  = ++_wsGen;          // 本连接代次；旧连接的 onclose 里代次不匹配则放弃重连
+  const sock = new WebSocket(`${proto}://${location.host}/ws/${currentSid}`);
+  ws = sock;
+  sock.onopen    = () => { setStatus('ready'); sendBtn.disabled = false; _reconnect = true; _startHeartbeat(); };
+  sock.onclose   = () => {
+    _stopHeartbeat(); setStatus('error'); sendBtn.disabled = true;
+    // 仅当本连接仍是当前代次时才重连；旧连接（已被 close 并换代）不再 spawn 新连接
+    if (_reconnect && gen === _wsGen) setTimeout(connect, 3000);
+  };
+  sock.onerror   = () => setStatus('error');
+  sock.onmessage = e => handleMessage(JSON.parse(e.data));
 }
-connect();
+
+// ── 心跳保活：每 15 秒发 ping，防止 LLM 长耗时导致浏览器空闲断连 ──
+let _heartbeatTimer = null;
+function _startHeartbeat() {
+  _stopHeartbeat();
+  _heartbeatTimer = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'ping' }));
+    }
+  }, 15000);
+}
+function _stopHeartbeat() {
+  if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
+}
 
 function setStatus(s) {
   statusDot.className = 'status-dot ' + s;
@@ -802,11 +869,13 @@ newChatBtn.addEventListener('click', () => { if (!isBusy) startNewChat(); });
 
 function startNewChat() {
   currentSid = 'sess_' + Math.random().toString(36).slice(2, 10);
+  setActiveSid(currentSid);
   memoryCount = 0;
   updateMemoryDisp();
   _reconnect = false;
   if (ws) ws.close();
   _reconnect = true;
+  _pendingSid = null;   // 新会话无本地快照可恢复，避免 session_state 误触发恢复
   connect();
   messages.innerHTML = '';
   showWelcome();
@@ -835,19 +904,36 @@ function openSession(sid) {
   const s = loadSessions().find(x => x.id === sid);
   if (!s) return;
   currentSid = sid;
+  setActiveSid(sid);
   memoryCount = s.turns ? s.turns.length : 0;
   updateMemoryDisp();
   _reconnect = false;
   if (ws) ws.close();
   _reconnect = true;
-  connect();
+  // 清空界面，交给 session_state 事件决定：
+  //   有后端事件缓冲 → 回放重建（运行中刷新场景）
+  //   无缓冲（服务重启）→ 本地快照恢复
   messages.innerHTML = '';
-  s.turns.forEach(t => {
-    appendUserMsg(t.goal);
-    appendResultBubble(t.summary, t.findings || []);
-  });
-  scrollBottom();
+  _pendingSid = sid;
+  connect();
   renderSidebar();
+}
+
+// 本地快照恢复（服务重启、后端无事件缓冲时使用）
+function restoreLocalSession(sid) {
+  const s = loadSessions().find(x => x.id === sid);
+  if (!s) { if (!messages.children.length) showWelcome(); return; }
+  if (s.html) {
+    messages.innerHTML = s.html;
+  } else if (s.turns && s.turns.length) {
+    s.turns.forEach(t => {
+      appendUserMsg(t.goal);
+      appendResultBubble(t.summary, t.findings || []);
+    });
+  } else {
+    showWelcome();
+  }
+  scrollBottom();
 }
 
 // ═══════════════════════════════════════════════════
@@ -859,11 +945,13 @@ function send() {
   if (!goal || isBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
   document.getElementById('welcome')?.remove();
   lastGoal = goal;
+  ensureSession(currentSid, goal);   // 立即创建会话条目，防止运行中刷新丢失
   appendUserMsg(goal);
   input.value = ''; autoResize();
   const maxIter = parseInt(document.getElementById('maxIter').value) || 10;
   ws.send(JSON.stringify({ goal, max_iterations: maxIter, thread_id: currentSid }));
   setBusy(true);
+  snapshotHtml(currentSid);           // 立即落盘快照
 }
 
 // ═══════════════════════════════════════════════════
@@ -878,11 +966,36 @@ const NODE_LABELS = {
 function handleMessage(data) {
   switch (data.type) {
 
+    case 'session_state': {
+      // 后端连接建立后的声明：有事件缓冲→等回放重建；无缓冲（服务重启）→本地快照恢复
+      if (data.has_history) {
+        messages.innerHTML = '';
+        currentRoundCard = null; currentBubble = null; frontendRound = 0;
+        lastSummary = ''; lastFindings = []; lastGoal = ''; testPlanCardEl = null;
+      } else if (_pendingSid) {
+        restoreLocalSession(_pendingSid);
+      }
+      _pendingSid = null;
+      break;
+    }
+
     case 'start':
+      // 新任务开始：彻底重建消息区，消除同会话旧任务的轮卡片/总结残留
+      // （正常发送与刷新回放场景都会先收到 start，这里以 data.goal 重建用户气泡）
+      messages.innerHTML = '';
+      if (data.goal) appendUserMsg(data.goal);
       currentRoundCard = null;
       frontendRound = 0;
       lastSummary   = '';
       lastFindings  = [];
+      testPlanCardEl = null;
+      // 恢复运行态：刷新回放场景下任务仍在后台跑，必须置为 busy
+      // （否则发送框可用、打断按钮隐藏，用户既无法打断又会重复发送）
+      setBusy(true);
+      break;
+
+    case 'test_plan':
+      renderTestPlanCard(data);
       break;
 
     case 'progress': {
@@ -903,6 +1016,7 @@ function handleMessage(data) {
         updateReflectionPanel(currentRoundCard, data);
       }
 
+      scheduleSnapshot();
       break;
     }
 
@@ -940,6 +1054,7 @@ function handleMessage(data) {
         updateMemoryDisp();
         lastGoal = '';
       }
+      snapshotHtml(currentSid);
       break;
     }
 
@@ -952,6 +1067,14 @@ function handleMessage(data) {
           badge.textContent = '已打断';
         }
       }
+      // 打断时也保存已产生的部分结果与画面，刷新后仍可查看
+      if (lastGoal) {
+        saveTurn(currentSid, lastGoal, lastSummary, lastFindings);
+        memoryCount++;
+        updateMemoryDisp();
+        lastGoal = '';
+      }
+      snapshotHtml(currentSid);
       setBusy(false);
       break;
     }
@@ -963,6 +1086,13 @@ function handleMessage(data) {
         const b = appendThinkingBubble();
         b.innerHTML = `<div class="agent-error">✗ ${escHtml(data.message)}</div>`;
       }
+      if (lastGoal) {
+        saveTurn(currentSid, lastGoal, lastSummary, lastFindings);
+        memoryCount++;
+        updateMemoryDisp();
+        lastGoal = '';
+      }
+      snapshotHtml(currentSid);
       currentRoundCard = null;
       setBusy(false);
       break;
@@ -972,6 +1102,67 @@ function handleMessage(data) {
 // ═══════════════════════════════════════════════════
 // Round Card DOM builders
 // ═══════════════════════════════════════════════════
+
+// 测试文档卡片（活文档：后续轮修订时原地更新，不重复追加）
+let testPlanCardEl = null;
+
+const TP_BADGES = {
+  pending: { color: 'var(--dim)',    bg: 'rgba(110,118,129,.15)', label: '待执行' },
+  done:    { color: 'var(--blue)',   bg: 'rgba(88,166,255,.15)',  label: '已执行' },
+  found:   { color: 'var(--red)',    bg: 'rgba(248,81,73,.15)',   label: '发现漏洞' },
+  failed:  { color: 'var(--yellow)', bg: 'rgba(210,153,34,.15)',  label: '失败' },
+};
+
+function renderTestPlanCard(data) {
+  const plan  = data.plan || {};
+  const total = data.total_rounds || '?';
+  const dirs  = Array.isArray(plan.directions) ? plan.directions : [];
+  if (!dirs.length) return;
+
+  let html = `
+    <div class="round-card" id="test-plan-card">
+      <div class="round-header">
+        <span class="round-number">📋 测试文档</span>
+        <span class="round-focus">共 ${escHtml(String(total))} 轮${data.round ? ` · 第 ${data.round} 轮更新` : ''}</span>
+        <span class="node-badge planning">计划</span>
+      </div>
+      <div style="padding:10px 14px;">`;
+  if (plan.objective) {
+    html += `<div style="font-size:13px;margin-bottom:10px;"><b>目标：</b>${escHtml(String(plan.objective).slice(0, 200))}</div>`;
+  }
+  dirs.forEach(d => {
+    const cases = Array.isArray(d.cases) ? d.cases : [];
+    const stat = {};
+    cases.forEach(c => { const s = c.status || 'pending'; stat[s] = (stat[s] || 0) + 1; });
+    const statStr = Object.entries(stat).map(([k, v]) => {
+      const b = TP_BADGES[k] || TP_BADGES.pending;
+      return `<span style="color:${b.color};font-size:11px;margin-right:6px;">${b.label}×${v}</span>`;
+    }).join('');
+    html += `<div style="margin:10px 0 4px;font-size:12px;font-weight:600;">
+      ${escHtml(String(d.direction || '?'))}
+      <span style="font-weight:400;color:var(--dim);">· ${cases.length} 用例 ${statStr}</span>
+    </div>`;
+    cases.forEach(c => {
+      const b = TP_BADGES[c.status] || TP_BADGES.pending;
+      html += `<div style="display:flex;gap:8px;align-items:baseline;padding:3px 0 3px 10px;font-size:12px;">
+        <span class="tool-tag">${escHtml(String(c.id || '?'))}</span>
+        <span style="color:var(--dim);flex:1;">${escHtml(String(c.desc || '').slice(0, 160))}</span>
+        <span style="color:${b.color};background:${b.bg};padding:1px 8px;border-radius:10px;font-size:11px;white-space:nowrap;">${b.label}</span>
+      </div>`;
+    });
+  });
+  html += `</div></div>`;
+
+  if (testPlanCardEl && testPlanCardEl.isConnected) {
+    testPlanCardEl.outerHTML = html;
+    testPlanCardEl = document.getElementById('test-plan-card');
+  } else {
+    const bubble = currentBubble || appendAgentBubbleForCard();
+    bubble.insertAdjacentHTML('beforeend', html);
+    testPlanCardEl = document.getElementById('test-plan-card');
+  }
+  scrollBottom();
+}
 
 function createRoundCard(round, vulnFocus) {
   // Collapse previous card if exists
@@ -1314,12 +1505,14 @@ function showResultBubble(summary, findings, finalReport) {
     return;
   }
 
+  // 兜底：刷新回放等场景下 currentBubble 可能为 null（轮卡片气泡未登记全局），
+  // 报告必须始终渲染——否则出现"只有完成徽章、无总结报告"的 bug
+  const bubble = currentBubble || appendAgentBubbleForCard();
+
   // Separator
-  if (currentBubble) {
-    const sep = document.createElement('hr');
-    sep.style.cssText = 'border:none;border-top:1px solid var(--border);margin:10px 0;';
-    currentBubble.appendChild(sep);
-  }
+  const sep = document.createElement('hr');
+  sep.style.cssText = 'border:none;border-top:1px solid var(--border);margin:10px 0;';
+  bubble.appendChild(sep);
 
   // Render content - use compact class for final reports
   const resultDiv = document.createElement('div');
@@ -1338,7 +1531,7 @@ function showResultBubble(summary, findings, finalReport) {
   }
 
   // Copy button
-  if (content && currentBubble) {
+  if (content) {
     const copyBtn = document.createElement('button');
     copyBtn.className = 'copy-btn';
     copyBtn.textContent = '复制';
@@ -1348,12 +1541,10 @@ function showResultBubble(summary, findings, finalReport) {
         setTimeout(() => copyBtn.textContent = '复制', 1500);
       });
     });
-    currentBubble.appendChild(copyBtn);
+    bubble.appendChild(copyBtn);
   }
 
-  if (currentBubble) {
-    currentBubble.appendChild(resultDiv);
-  }
+  bubble.appendChild(resultDiv);
   scrollBottom();
 }
 
@@ -1411,8 +1602,20 @@ stopBtn.addEventListener('click', () => {
 });
 function fillExample(el) { input.value = el.textContent; input.focus(); autoResize(); }
 
-// Init
+// ═══════════════════════════════════════════════════
+// Init：自动恢复到上次会话，否则新建
+// ═══════════════════════════════════════════════════
+function bootstrap() {
+  const activeSid = localStorage.getItem(ACTIVE_KEY);
+  const sessions = loadSessions();
+  if (activeSid && sessions.find(s => s.id === activeSid)) {
+    openSession(activeSid);
+  } else {
+    startNewChat();
+  }
+}
 renderSidebar();
+bootstrap();
 </script>
 </body>
 </html>

@@ -1,8 +1,7 @@
 ---
 name: secknowledge-skill
 description: |
-  Web+AI 安全测试知识库。融合 WooYun 88,636 案例 + 先知 L1-L4 方法论 + GAARM 173 风险
-  + OWASP Top 10 (LLM/ASI/WSTG)。
+  **当用户要求渗透测试、漏洞挖掘/利用、红队攻防、安全审计 (SAST/DAST)、CTF、AI/LLM 安全测试时**
   TRIGGER when 任务是实战安全测试：渗透测试、漏洞挖掘/利用、红队攻防、安全审计 (SAST/DAST)、
   CTF、AI/LLM 安全测试 (Prompt 注入/越狱/MCP/Agent/沙箱逃逸)。用户明确给出测试目标
   (URL/代码/模型/Agent 架构) 且意图是"测试/审计/挖漏洞/利用"。
