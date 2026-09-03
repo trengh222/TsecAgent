@@ -851,13 +851,18 @@ function setStatus(s) {
   statusDot.title = ({ '':'连接中...', ready:'已连接', busy:'运行中...', error:'断开' })[s] || '';
 }
 function setBusy(v) {
-  isBusy = v; sendBtn.disabled = v; newChatBtn.disabled = v;
+  isBusy = v; newChatBtn.disabled = v;
   setStatus(v ? 'busy' : 'ready');
   if (v) {
     stopBtn.classList.add('visible');
+    // busy 时发送框转为“补充/纠正”输入，不影响正在运行的任务
+    sendBtn.disabled = false;
+    sendBtn.textContent = '补充';
   } else {
     stopBtn.classList.remove('visible');
     roundDisp.textContent = '';
+    sendBtn.disabled = false;
+    sendBtn.textContent = '发送';
   }
 }
 
@@ -942,7 +947,17 @@ function restoreLocalSession(sid) {
 
 function send() {
   const goal = input.value.trim();
-  if (!goal || isBusy || !ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!goal || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+  // 运行中发送 → 作为“补充/纠正”注入后续轮次，不打断任务
+  if (isBusy) {
+    ws.send(JSON.stringify({ type: 'steer', content: goal }));
+    appendUserMsg('[补充] ' + goal);
+    input.value = ''; autoResize();
+    snapshotHtml(currentSid);
+    return;
+  }
+
   document.getElementById('welcome')?.remove();
   lastGoal = goal;
   ensureSession(currentSid, goal);   // 立即创建会话条目，防止运行中刷新丢失
@@ -980,15 +995,15 @@ function handleMessage(data) {
     }
 
     case 'start':
-      // 新任务开始：彻底重建消息区，消除同会话旧任务的轮卡片/总结残留
-      // （正常发送与刷新回放场景都会先收到 start，这里以 data.goal 重建用户气泡）
-      messages.innerHTML = '';
-      if (data.goal) appendUserMsg(data.goal);
+      // 保留历史对话：此前任务的轮卡片与总结不清除，只重置当前任务的运行时游标
       currentRoundCard = null;
       frontendRound = 0;
       lastSummary   = '';
       lastFindings  = [];
       testPlanCardEl = null;
+      // 仅刷新回放（消息区已被 session_state 清空）时重建用户气泡；
+      // 正常连续提问时 send() 已 append 过用户消息，这里不重复
+      if (data.goal && !messages.querySelector('.msg.user')) appendUserMsg(data.goal);
       // 恢复运行态：刷新回放场景下任务仍在后台跑，必须置为 busy
       // （否则发送框可用、打断按钮隐藏，用户既无法打断又会重复发送）
       setBusy(true);

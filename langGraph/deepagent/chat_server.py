@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging as _logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -78,14 +79,21 @@ def _save_session_memory() -> None:
         logger.warning("session_memory_save_failed", error=str(e))
 
 
-def _append_session_memory(session_id: str, goal: str, summary: str, findings: list) -> None:
-    """任务完成后记账：写入内存 + 磁盘，供同会话的下一轮提问携带记忆。"""
+def _append_session_memory(session_id: str, goal: str, summary: str, findings: list, attack_state: Optional[dict] = None) -> None:
+    """任务完成后记账：写入内存 + 磁盘，供同会话的下一轮提问携带记忆。
+
+    attack_state: 本轮任务的结构化战果（确认漏洞/资产面板/未破门槛等），
+    让下一轮提问"结合上次测试结果"而非仅凭摘要文本从零开始。
+    """
     mem = _session_memory.setdefault(session_id, [])
-    mem.append({
+    turn = {
         "goal": goal,
         "summary": summary or f"（第 {len(mem) + 1} 轮任务已完成）",
         "findings": findings,
-    })
+    }
+    if attack_state:
+        turn["attack_state"] = attack_state
+    mem.append(turn)
     # 最多保留最近 10 轮
     if len(mem) > 10:
         _session_memory[session_id] = mem[-10:]
@@ -96,6 +104,9 @@ _load_session_memory()
 
 # ── 正在运行的任务：session_id -> asyncio.Task（用于打断）
 _running_tasks: Dict[str, asyncio.Task] = {}
+
+# ── 正在运行的 agent 实例：session_id -> DeepAgent（用于运行时注入 steer 纠偏指令）
+_running_agents: Dict[str, Any] = {}
 
 # ── 协作式停止标志：session_id -> asyncio.Event（打断时置位，_run_agent 在
 #    每个流事件处检查并主动退出，配合 task.cancel() 双保险）
@@ -352,9 +363,33 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 await send({"type": "memory_cleared"})
                 continue
 
+            # ── 实时纠偏/补充信息（steer）：不打断任务，注入后续轮次 ──
+            if msg.get("type") == "steer":
+                _steer = (msg.get("content") or "").strip()
+                if not _steer:
+                    await send({"type": "error", "message": "补充内容不能为空"})
+                    continue
+                _agent = _running_agents.get(session_id)
+                _task = _running_tasks.get(session_id)
+                if _agent and _task and not _task.done():
+                    _agent.graph.steering.append(_steer)
+                    logger.info("steer_injected", session_id=session_id, content=_steer[:60])
+                    await send({"type": "steer_ack", "content": _steer})
+                else:
+                    await send({"type": "error", "message": "当前没有运行中的任务，请直接输入问题"})
+                continue
+
             goal = (msg.get("goal") or "").strip()
             if not goal:
                 await send({"type": "error", "message": "目标不能为空"})
+                continue
+
+            # ── 意图分流：知识查询走快速问答，测试走 agent 流程 ──
+            _intent = _classify_intent(goal)
+            if _intent["intent"] == "query":
+                logger.info("query_dispatch", session_id=session_id, goal=goal[:60],
+                            confidence=_intent["confidence"])
+                await _answer_query(session_id, goal, send)
                 continue
 
             # 防并发：同会话同时只允许一个 agent 任务，避免两个任务共享 executor
@@ -390,6 +425,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
             def _on_agent_done(t: asyncio.Task, sid: str = session_id):
                 _running_tasks.pop(sid, None)
+                _running_agents.pop(sid, None)
                 _session_stops.pop(sid, None)
                 # 取出异常避免 "exception was never retrieved"（内部已处理并广播 error）
                 if not t.cancelled() and t.exception():
@@ -407,18 +443,111 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
 
 def _build_goal_with_memory(goal: str, history: list) -> str:
-    """将历史对话摘要拼接到当前 goal 前，让 agent 感知上下文。"""
+    """将历史对话摘要 + 最近一次结构化战果拼接到当前 goal 前，让 agent 感知上下文。
+
+    除逐轮摘要外，额外注入"上次测试战果"（确认漏洞/资产面板/未破门槛），
+    使 agent 能站在上次测试结果基础上继续或纠偏，而非仅凭摘要从零开始。
+    """
     if not history:
         return goal
     lines = ["【本次会话历史记录（请结合上下文理解当前目标）】"]
     for i, turn in enumerate(history, 1):
-        lines.append(f"第{i}轮 目标: {turn['goal']}")
+        lines.append(f"第{i}次提问 目标: {turn['goal']}")
         if turn.get("summary"):
-            lines.append(f"第{i}轮 结论: {turn['summary'][:300]}")
+            lines.append(f"第{i}次提问 收尾概括: {turn['summary'][:500]}")
         if turn.get("findings"):
-            lines.append(f"第{i}轮 发现: {'; '.join(str(f) for f in turn['findings'][:5])}")
+            lines.append(f"第{i}次提问 发现: {'; '.join(str(f) for f in turn['findings'][:5])}")
+
+    # 最近一次携带结构化战果的任务：作为"上次战果"紧贴当前目标注入
+    _last_attack = None
+    for turn in reversed(history):
+        if turn.get("attack_state"):
+            _last_attack = turn["attack_state"]
+            break
+    if _last_attack:
+        _as = _last_attack
+        _battle_lines = []
+        for v in (_as.get("confirmed_vulns") or [])[:5]:
+            _battle_lines.append(
+                f"  · 已确认[{v.get('vuln_type')}]: {str(v.get('proof_brief', ''))[:80]}"
+                + (f" payload={str(v.get('payload', ''))[:80]}" if v.get('payload') else "")
+            )
+        for a in (_as.get("assets") or [])[:10]:
+            _battle_lines.append(f"  · 资产[{a.get('kind')}]: {str(a.get('desc'))[:90]}")
+        for b in (_as.get("blockers") or [])[:5]:
+            _battle_lines.append(f"  · 未破门槛: {str(b.get('desc'))[:120]}")
+        if _battle_lines:
+            lines.append("【上次测试战果（本轮必须结合继续，禁止重复已确认内容）】")
+            lines.extend(_battle_lines)
     lines.append(f"\n【当前目标】{goal}")
     return "\n".join(lines)
+
+
+# ── 意图分类：测试(query 之外的 agent 流程) vs 知识查询(query 走快速问答) ────
+_TEST_INTENT_WORDS = (
+    "测试", "渗透", "挖洞", "利用", "审计", "扫描", "打靶", "攻击", "复现",
+    "pentest", "exploit", "recon", "漏洞挖掘", "测一下", "帮我测", "检测漏洞",
+    "getshell", "get flag", "拿flag",
+)
+_QUERY_INTENT_WORDS = (
+    "是什么", "原理", "介绍", "讲解", "说明", "怎么防御", "如何防护", "如何修复",
+    "查询", "检索", "查一下", "知识", "区别", "定义", "概念", "有哪些", "分类",
+    "方法", "流程",
+)
+_URL_RE = re.compile(r"https?://|(\d{1,3}\.){3}\d{1,3}(:\d{1,5})?")
+
+
+def _classify_intent(goal: str) -> dict:
+    """判定用户本轮输入是『测试』还是『知识查询』（规则优先，低置信度交给前端追问）。"""
+    g = (goal or "").strip()
+    low = g.lower()
+    has_target = bool(_URL_RE.search(g)) or "```" in g or "/flag" in low or "flag" in low
+    has_test_word = any(w in low for w in _TEST_INTENT_WORDS)
+    has_query_word = any(w in g for w in _QUERY_INTENT_WORDS)
+
+    if has_target and has_query_word and not has_test_word:
+        return {"intent": "query", "confidence": "medium",
+                "reason": "含目标但为查询/理解类问句"}
+    if has_target:
+        return {"intent": "test", "confidence": "high", "reason": "检测到测试目标"}
+    if has_test_word:
+        return {"intent": "test", "confidence": "medium", "reason": "检测到测试意图动词"}
+    if has_query_word:
+        return {"intent": "query", "confidence": "high", "reason": "检测到查询/概念类问句"}
+    return {"intent": "query", "confidence": "low", "reason": "无明确目标与意图，默认按知识问答处理"}
+
+
+async def _answer_query(session_id: str, goal: str, send) -> None:
+    """知识问答路径：检索知识库 + LLM 生成带引用答案，不启动 PER 测试循环。"""
+    _session_events[session_id] = []
+    await send({"type": "start", "goal": goal})
+
+    kb_ctx = ""
+    try:
+        _res = await _executors["knowledge"].search(goal, limit=5)
+        for r in (_res.get("results") or [])[:5]:
+            if isinstance(r, dict):
+                _title = r.get("title") or r.get("id") or r.get("name") or ""
+                _snip = r.get("snippet") or r.get("content") or r.get("text") or ""
+                kb_ctx += f"- {_title}: {str(_snip)[:300]}\n"
+    except Exception as e:
+        logger.warning("query_kb_search_failed", error=str(e))
+
+    prompt = (
+        "你是安全知识助手。请用中文简洁回答用户问题，可结合下方知识库检索结果；"
+        "若检索为空则基于通用安全知识回答并在不确定处注明，禁止编造 CVE/payload 细节。\n"
+        f"用户问题: {goal}\n\n知识库检索结果:\n{kb_ctx or '（无）'}\n\n"
+        "请直接回答，控制在 3 个要点以内。"
+    )
+    try:
+        answer = await _llm.ainvoke(prompt)
+        text = answer.content if hasattr(answer, "content") else str(answer)
+    except Exception as e:
+        logger.error("query_llm_failed", error=str(e))
+        text = f"（回答生成失败：{e}）"
+    await send({"type": "done", "summary": (text or "").strip(),
+                "key_findings": [], "final_report": None})
+    _append_session_memory(session_id, goal, (text or "").strip()[:300], [])
 
 
 async def _run_agent(
@@ -429,15 +558,17 @@ async def _run_agent(
     max_iter: int,
     send,
     stop: asyncio.Event,
-) -> tuple[str, list]:
-    """执行 agent 流，流式推送进度，返回 (summary, findings)。
+) -> tuple[str, list, dict]:
+    """执行 agent 流，流式推送进度，返回 (summary, findings, attack_state)。
 
     clean_goal   用户本轮原始目标（写会话记忆用，不含历史前缀）；
     enriched_goal 拼接了会话历史的完整目标（喂给 agent 图用）；
     stop         协作式停止标志——打断时置位，本函数在每个流事件处
                  检查并主动退出（不发送 done，interrupted 由打断方发送）。
+    attack_state 本轮结构化战果（确认漏洞/资产面板/未破门槛），供会话记忆复用。
     """
     agent = _make_agent(max_iterations=max_iter)
+    _running_agents[session_id] = agent   # 注册，供 steer 消息运行时注入纠偏指令
     last_summary = ""
     last_key_findings: list = []
     last_final_report: str | None = None
@@ -519,7 +650,7 @@ async def _run_agent(
 
         # 打断（协作式退出）：不发 done（interrupted 已由打断方发送）、不写记忆
         if interrupted:
-            return last_summary, last_key_findings
+            return last_summary, last_key_findings, {}
 
         if not last_summary and last_state is not None:
             last_summary = _extract_last_ai_message(last_state)
@@ -544,11 +675,16 @@ async def _run_agent(
         })
 
         # 会话记忆：任务真正完成后立即记账（写在 _run_agent 内，WebSocket 断开也不丢）
-        _append_session_memory(session_id, clean_goal, last_summary, last_key_findings)
+        # 额外保存结构化战果，让同会话下一轮提问"结合上次测试结果"
+        attack_state = _extract_attack_state(last_state) if last_state else {}
+        # 收尾概括：优先用 summarizer 生成的最终报告（含结论/证据/利用链），
+        # 而非仅反射节点的零散 summary——这才是"本次提问的收尾概括"
+        _summary_for_mem = (last_final_report or last_summary or "").strip()
+        _append_session_memory(session_id, clean_goal, _summary_for_mem, last_key_findings, attack_state)
 
         logger.info("task_done", session_id=session_id,
                     report_len=len(last_final_report or ""))
-        return last_summary, last_key_findings
+        return last_summary, last_key_findings, attack_state
     except asyncio.CancelledError:
         # 强制 cancel（打断的第二层保险）：不发 done、不写记忆，由打断方发 interrupted
         logger.info("agent_task_cancelled", session_id=session_id)
@@ -564,7 +700,7 @@ async def _run_agent(
                 "type": "error",
                 "message": f"Agent执行错误: {_err}"
             })
-        return "", []
+        return "", [], {}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -575,6 +711,28 @@ def _sget(state, key, default=None):
     if isinstance(state, dict):
         return state.get(key, default)
     return getattr(state, key, default)
+
+
+def _extract_attack_state(state) -> dict:
+    """从最终状态提取结构化战果（确认漏洞/资产面板/未破门槛），供会话记忆复用。"""
+    planner = _sget(state, "planner") or {}
+
+    def _g(key):
+        if isinstance(planner, dict):
+            return planner.get(key) or []
+        return getattr(planner, key, None) or []
+
+    ev_vault = _g("evidence_vault")
+    return {
+        "confirmed_vulns": _g("confirmed_vulns")[:5],
+        "assets": _g("assets")[:12],
+        "blockers": _g("blockers")[:6],
+        # 证据原文库只存 id/kind 目录（原文过长不便入库，跨轮引用靠摘要+确认漏洞）
+        "evidence_vault": [
+            {"id": e.get("id"), "kind": e.get("kind")}
+            for e in ev_vault[-6:] if isinstance(e, dict)
+        ],
+    }
 
 
 def _extract_last_ai_message(state) -> str:

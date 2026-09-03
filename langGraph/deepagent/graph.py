@@ -221,7 +221,7 @@ def _real_goal(goal: str, max_len: int = 300) -> str:
     return goal[:max_len]
 
 
-def _history_of_goal(goal: str, max_len: int = 1000) -> str:
+def _history_of_goal(goal: str, max_len: int = 2000) -> str:
     """从 enriched_goal 中提取会话历史前缀（【当前目标】之前的部分，与 _real_goal 互补）。"""
     marker = "【当前目标】"
     idx = goal.rfind(marker)
@@ -328,6 +328,10 @@ class DeepAgentGraph:
         # 证据原文库去重：已入 vault 的证据指纹（前 60 字符），实例级跨轮去重
         self._evidence_seen: Set[str] = set()
         self._evidence_id: int = 0
+        # 用户实时纠偏/补充指令（steer）：运行中由 chat_server 追加，Planner 每轮消费
+        # （不打断任务，只影响后续轮次的方向与任务生成）
+        self.steering: List[str] = []
+        self._steering_consumed: int = 0
         self.compressor = ContextCompressor(llm)
 
         self.graph = self._build_graph()
@@ -440,6 +444,16 @@ class DeepAgentGraph:
             next_hops_hint = (
                 "\n━━━ 上轮反思建议的下一跳候选（优先采纳，除非有更强理由）━━━\n"
                 + "\n".join(f"  · {str(s)[:160]}" for s in _sns[:3]) + "\n"
+            )
+
+        # ── 用户实时纠偏/补充（steer）：运行中追加的指令，本轮必须纳入 ──
+        steering_hint = ""
+        if self._steering_consumed < len(self.steering):
+            _steers = self.steering[self._steering_consumed:]
+            self._steering_consumed = len(self.steering)
+            steering_hint = (
+                "\n⚠️⚠️ 【用户实时指令——最高优先级，本轮任务必须体现】⚠️⚠️\n"
+                + "\n".join(f"  · {str(s)[:300]}" for s in _steers[-3:]) + "\n"
             )
 
         # ── 回显相同警告 + 防沉迷历史（由 executor 节点记录）────────────
@@ -614,7 +628,7 @@ class DeepAgentGraph:
 已停滞: {state.planner.stalled_directions}
 被拒策略: {json.dumps(_rejected_brief, ensure_ascii=False)[:100]}
 {"历史经验: " + "; ".join(state.planner.long_term_goals[:3]) if state.planner.long_term_goals else ""}
-{_dup_brief}{tried_payloads_hint}{same_output_hint}{kb_hint}{skill_hint}{chain_hint}{asset_hint}{next_hops_hint}{pivot_instruction}
+{_dup_brief}{tried_payloads_hint}{same_output_hint}{kb_hint}{skill_hint}{chain_hint}{asset_hint}{next_hops_hint}{steering_hint}{pivot_instruction}
 
 ━━━ OWASP Top10（逐一测试，3轮无果换方向）━━━
 {state.planner.applicable_directions or 'A01-访问控制 | A02-加密失败 | A03-SQL注入 | A04-不安全设计 | A05-安全配置错误 | A06-已知漏洞组件 | A07-身份认证失败 | A08-完整性失败 | A09-日志缺失 | A10-SSRF'}
