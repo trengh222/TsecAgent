@@ -110,8 +110,12 @@ class DeepAgent:
                 "error": str(e),
             }
 
-    async def stream(self, goal: str, thread_id: str = "default"):
+    async def stream(self, goal: str, thread_id: str = "default", scan_seeds: Optional[list] = None):
         """流式运行 Agent，逐节点 yield 状态更新事件。
+
+        Args:
+            scan_seeds: 确定性扫描种子（nuclei 预扫结果，可选），
+                        注入 Planner 作为规划起点——机器枚举打底，模型做关联裁决。
 
         Yields:
             LangGraph 事件字典 {"node_name": state}
@@ -125,6 +129,8 @@ class DeepAgent:
             current_goal=goal,
             messages=[{"role": "user", "content": goal}],
         )
+        if scan_seeds:
+            initial_state.planner.scan_seeds = list(scan_seeds)
         # 每次新 goal 都需要传入 initial_state 让图从头开始跑完整的 PER 循环。
         # 使用独立 thread_id 隔离每次对话轮次，避免 checkpoint 携带上轮残留状态。
         async for event in self.graph.app.astream(initial_state, config):

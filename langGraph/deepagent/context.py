@@ -46,6 +46,16 @@ class PlannerContext(BaseModel):
     # 目标分析：根据 URL 特征筛选出的适用方向（为空表示全部方向适用）
     applicable_directions: Optional[List[str]] = None
 
+    # 威胁建模（§4）：首轮强制产出，后续轮作为攻击面切分的种子输入
+    # 结构: {
+    #   "assets": ["高价值资产描述", ...],                    # 资产清单
+    #   "trust_boundaries": [{"name","desc"}, ...],          # 信任边界
+    #   "entry_points": [{"id":"EP1","url","method","params":[...],
+    #                     "auth_required":bool,"reachable":bool}, ...]  # 入口点
+    #   "counterexamples": ["反例假设（自认安全、待证伪的点）", ...],
+    # }
+    threat_model: Optional[Dict[str, Any]] = None
+
     # ── 计划驱动流程 ──────────────────────────────────────────────
     # 首轮规划确定的总思考轮数（后续轮次按此推进，末轮自动收尾总结）
     total_rounds: Optional[int] = None
@@ -68,6 +78,13 @@ class PlannerContext(BaseModel):
     # 证据原文库：服务端自动从每轮执行结果提取的高价值证据原文（防摘要丢细节）
     # 每项: {"id": 递增编号, "kind": 证据类型, "content": 原文摘录, "round": 轮次}
     evidence_vault: List[Dict[str, Any]] = Field(default_factory=list)
+
+    # ── 确定性扫描种子（nuclei 预扫，任务开始前服务端自动执行）──────
+    # 每项: {"kind": tech|cve-match|exposure|info,
+    #        "desc": "模板名+severity 一句话", "evidence": "命中 URL",
+    #        "covered": false(未验证)/true(已并入测试)}
+    # Planner 每轮可见：优先利用种子规划任务，禁止重复扫描已覆盖项
+    scan_seeds: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class ReflectorContext(BaseModel):

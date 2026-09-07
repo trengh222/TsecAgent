@@ -550,6 +550,256 @@ async def _answer_query(session_id: str, goal: str, send) -> None:
     _append_session_memory(session_id, goal, (text or "").strip()[:300], [])
 
 
+# ── 确定性扫描种子：nuclei 预扫（任务开始前自动执行，结果注入 Planner）────
+_SCAN_CACHE: Dict[str, list] = {}          # 目标 URL -> 种子列表（同 URL 只扫一次）
+
+
+def _extract_target_url(goal: str) -> Optional[str]:
+    """从目标文本提取 http(s) URL；无 URL 返回 None（不触发预扫）。"""
+    m = re.search(r'https?://[^\s<>"\'，。]+', goal or "")
+    return m.group(0).rstrip(".,;") if m else None
+
+
+async def _run_nuclei_seeds(url: str) -> list:
+    """用项目内 nuclei 引擎 + 模板预扫目标，返回结构化种子列表。
+
+    超时盒 90 秒：超时/工具缺失/解析失败一律静默降级为空列表（不阻塞任务）。
+    命中项仅作"种子假设"，进入 Planner 后仍须验证。
+    """
+    from deepagent.graph import _NUCLEI_BIN, _NUCLEI_TEMPLATES, _nuclei_available
+    if not _nuclei_available():
+        return []
+
+    import tempfile
+    out_path = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False).name
+    _tpl = _NUCLEI_TEMPLATES
+    cmd = [
+        _NUCLEI_BIN,
+        "-t", os.path.join(_tpl, "http", "technologies"),
+        "-t", os.path.join(_tpl, "http", "exposures"),
+        "-t", os.path.join(_tpl, "http", "cves"),
+        "-u", url,
+        "-duc", "-silent", "-jsonl", "-o", out_path,
+        "-c", "10", "-timeout", "15",
+    ]
+    rc = await asyncio.to_thread(_run_cmd_sync, cmd, 90.0)
+    if rc != 0:
+        logger.warning("nuclei_prescan_failed", url=url, rc=rc)
+
+    seeds: list = []
+    try:
+        with open(out_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                tid = str(d.get("template-id") or "")
+                info = d.get("info") or {}
+                name = str(info.get("name") or tid)
+                sev = str(info.get("severity") or "info")
+                matched = str(d.get("matched-at") or url)[:120]
+                if "/cves/" in tid or tid.upper().startswith("CVE"):
+                    kind = "cve-match"
+                elif "/technologies/" in tid or "technology" in tid.lower() or "detect" in name.lower():
+                    kind = "tech"
+                elif "/exposures/" in tid:
+                    kind = "exposure"
+                else:
+                    kind = "info"
+                seeds.append({
+                    "kind": kind,
+                    "desc": f"{name} [{sev}]",
+                    "evidence": matched,
+                    "covered": False,
+                })
+        seeds = seeds[:20]
+    except Exception as e:
+        logger.warning("nuclei_seeds_parse_failed", error=str(e))
+    finally:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+    return seeds
+
+
+# ffuf 内置小字典（≤50 条常见路径；无外部字典依赖，超时盒内快速爆破）
+_FFUF_PATHS = [
+    "admin", "login", "api", "backup", ".git", "robots.txt", "flag", "flag.txt",
+    "flag.php", "index.php", "config.php", "config.php.bak", "index.php.bak",
+    "upload", "uploads", "db", "phpmyadmin", "console", "static", "src", "test",
+    "dev", "docs", "swagger", "actuator", ".env", "env", ".svn", "wp-admin",
+    "shell", "tmp", "data", "assets", "image", "images", "file", "download",
+    "source", "www.zip", "backup.zip", "readme", "README.md", "node_modules",
+    "vendor", "composer.json", ".git/config", "web", "app", "main", "include",
+]
+
+_NMAP_TIMEOUT = 120
+_FFUF_TIMEOUT = 40
+
+
+def _run_cmd_sync(cmd: list, timeout: float) -> int:
+    """同步执行子进程（线程池内运行）。timeout 到期由 subprocess.run 自动 kill。
+
+    Windows Proactor 事件循环直接 create_subprocess_exec 并发多进程有挂起风险，
+    统一走线程池同步执行，超时/异常均返回非 0（调用方静默降级）。
+    """
+    import subprocess as sp
+    try:
+        sp.run(cmd, stdout=sp.DEVNULL, stderr=sp.DEVNULL, timeout=timeout)
+        return 0
+    except sp.TimeoutExpired:
+        return -1
+    except Exception:
+        return -2
+
+
+async def _run_nmap_seeds(url: str) -> list:
+    """nmap 端口/服务预扫（--top-ports 100，greppable 输出），返回 port 种子。"""
+    from deepagent.graph import _nmap_path
+    from urllib.parse import urlparse
+    nmap_bin = _nmap_path()
+    if not nmap_bin:
+        return []
+    host = (urlparse(url).hostname or "").strip()
+    if not host:
+        return []
+
+    import tempfile
+    out_path = tempfile.NamedTemporaryFile(suffix=".gnmap", delete=False).name
+    cmd = [nmap_bin, "-sV", "-Pn", "--top-ports", "100", "-oG", out_path, host]
+    rc = await asyncio.to_thread(_run_cmd_sync, cmd, float(_NMAP_TIMEOUT))
+    if rc != 0:
+        logger.warning("nmap_prescan_failed", host=host, rc=rc)
+
+    seeds: list = []
+    try:
+        with open(out_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if "Ports:" not in line:
+                    continue
+                ports_part = line.split("Ports:", 1)[1].strip()
+                for entry in ports_part.split(","):
+                    entry = entry.strip()
+                    parts = entry.split("/")
+                    if len(parts) < 5:
+                        continue
+                    port, state, proto = parts[0], parts[1], parts[2]
+                    service = parts[4] if len(parts) > 4 else ""
+                    version = parts[6] if len(parts) > 6 else ""
+                    if state != "open":
+                        continue
+                    desc = f"{port}/{proto} {service}".strip()
+                    if version:
+                        desc += f" {version}"
+                    seeds.append({
+                        "kind": "port",
+                        "desc": desc,
+                        "evidence": f"{host}:{port}",
+                        "covered": False,
+                    })
+        seeds = seeds[:12]
+    except Exception as e:
+        logger.warning("nmap_seeds_parse_failed", error=str(e))
+    finally:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+    return seeds
+
+
+async def _run_ffuf_seeds(url: str) -> list:
+    """ffuf 目录爆破预扫（内置小字典 + JSON 输出），返回 directory 种子。"""
+    from deepagent.graph import _FFUF_BIN, _ffuf_available
+    from urllib.parse import urlparse
+    if not _ffuf_available():
+        return []
+    _p = urlparse(url)
+    if not _p.hostname:
+        return []
+    base = f"{_p.scheme}://{_p.hostname}" + (f":{_p.port}" if _p.port else "")
+
+    import tempfile
+    dict_path = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
+    out_path = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
+    try:
+        with open(dict_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(_FFUF_PATHS))
+    except Exception:
+        return []
+
+    cmd = [
+        _FFUF_BIN, "-u", base + "/FUZZ", "-w", dict_path,
+        "-mc", "200,301,302,403", "-t", "8", "-timeout", "10",
+        "-o", out_path, "-of", "json", "-s",
+    ]
+    rc = await asyncio.to_thread(_run_cmd_sync, cmd, float(_FFUF_TIMEOUT))
+    if rc != 0:
+        logger.warning("ffuf_prescan_failed", url=url, rc=rc)
+
+    seeds: list = []
+    try:
+        with open(out_path, encoding="utf-8", errors="ignore") as f:
+            jdata = json.load(f)
+        for r in (jdata.get("results") or [])[:25]:
+            if not isinstance(r, dict):
+                continue
+            hit_url = str(r.get("url") or "")
+            status = r.get("status", 0)
+            length = r.get("length", 0)
+            path = (urlparse(hit_url).path or "/").strip()
+            if not path or path == "/":
+                continue
+            seeds.append({
+                "kind": "directory",
+                "desc": f"{path} [{status}]",
+                "evidence": f"len={length}",
+                "covered": False,
+            })
+        seeds = seeds[:15]
+    except Exception as e:
+        logger.warning("ffuf_seeds_parse_failed", error=str(e))
+    finally:
+        for _f in (dict_path, out_path):
+            try:
+                os.unlink(_f)
+            except Exception:
+                pass
+    return seeds
+
+
+async def _run_prescan(url: str) -> list:
+    """确定性预扫总入口：nuclei + nmap + ffuf 并行，结果合并去重为种子列表。
+
+    任一环节超时/失败/工具缺失均静默降级（空列表），绝不阻塞任务。
+    """
+    results = await asyncio.gather(
+        _run_nuclei_seeds(url),
+        _run_nmap_seeds(url),
+        _run_ffuf_seeds(url),
+        return_exceptions=True,
+    )
+    seeds: list = []
+    for part in results:
+        if isinstance(part, list):
+            seeds.extend(part)
+    # 去重（kind + desc 指纹）
+    seen = set()
+    unique = []
+    for s in seeds:
+        sig = f"{s.get('kind')}|{str(s.get('desc'))[:60]}"
+        if sig in seen:
+            continue
+        seen.add(sig)
+        unique.append(s)
+    return unique[:30]
+
+
 async def _run_agent(
     session_id: str,
     clean_goal: str,
@@ -576,7 +826,21 @@ async def _run_agent(
     interrupted = False
 
     try:
-        async for event in agent.stream(enriched_goal, thread_id=thread_id):
+        # ── 确定性扫描种子：nuclei + nmap + ffuf 预扫（超时盒内并行、同 URL 缓存），
+        #    结果作为种子注入 Planner（机器枚举打底，模型只做关联/裁决）──
+        scan_seeds: list = []
+        _scan_url = _extract_target_url(enriched_goal)
+        if _scan_url:
+            if _scan_url in _SCAN_CACHE:
+                scan_seeds = _SCAN_CACHE[_scan_url]
+            else:
+                await send({"type": "scan_start", "target": _scan_url})
+                scan_seeds = await _run_prescan(_scan_url)
+                _SCAN_CACHE[_scan_url] = scan_seeds
+            await send({"type": "scan_seeds", "target": _scan_url,
+                        "count": len(scan_seeds), "items": scan_seeds[:12]})
+
+        async for event in agent.stream(enriched_goal, thread_id=thread_id, scan_seeds=scan_seeds):
             if stop.is_set():
                 interrupted = True
                 logger.info("agent_stopped_by_flag", session_id=session_id)

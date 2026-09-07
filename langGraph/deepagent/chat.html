@@ -994,6 +994,23 @@ function handleMessage(data) {
       break;
     }
 
+    case 'scan_start':
+      appendAgentBubbleForCard().innerHTML =
+        `<div class="md-content"><strong>确定性扫描中…</strong> nuclei 预扫 ${escHtml(data.target || '')}</div>`;
+      scrollBottom();
+      break;
+
+    case 'scan_seeds': {
+      const items = Array.isArray(data.items) ? data.items : [];
+      const body = items.length
+        ? items.map(s => `· [${s.kind}] ${escHtml(s.desc || '')}`).join('<br>')
+        : '未命中任何模板（种子为空，按常规流程规划）';
+      appendAgentBubbleForCard().innerHTML =
+        `<div class="md-content"><strong>确定性扫描种子（${data.count || 0} 条，仅作假设待验证）</strong><br>${body}</div>`;
+      scrollBottom();
+      break;
+    }
+
     case 'start':
       // 保留历史对话：此前任务的轮卡片与总结不清除，只重置当前任务的运行时游标
       currentRoundCard = null;

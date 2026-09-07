@@ -1,0 +1,282 @@
+# CWE 模式库 —— 黑盒 Web 漏洞挖掘"逐类质问"清单
+# 借鉴 xz.aliyun《漏洞挖掘 Agent 设计规范》§5.3：每个条目 = 触发特征 + 需证明 +
+# 常见误报原因 + 检查步骤。用法：
+#   1) Finder/Planner 生成任务时按当前 OWASP 方向路由到对应条目，作为质问清单逐条对照
+#   2) 确定性扫描器（nuclei 模板等）的规则源参考
+# 字段约定（必填）:
+#   id:         唯一编号（CWE-xxx 或本项目扩展如 WEB-xxx）
+#   name:       中文名
+#   owasp:      OWASP Top10 方向（A01-A10，可多值逗号分隔）
+#   kind:       类别（injection/access-control/crypto/file/ssrf/xss/misc）
+#   trigger_signals:  黑盒可观测触发特征（命中即启动该模式的质问）
+#   prove_required:   必须逐项证明（证据链闭环，否则降级 suspected）
+#   false_positives:  常见误报原因（自检必查）
+#   check_steps:      Finder 质问清单（顺序执行，每步可生成对应测试任务）
+#   knowledge_file:   对应 secknowledge 手册（payload 细节出处）
+#   nuclei_tags:      对应 nuclei 模板子目录（确定性扫描对照）
+patterns:
+  - id: CWE-89
+    name: SQL注入
+    owasp: A03
+    kind: injection
+    trigger_signals:
+      - SQL 报错回显（syntax error / mysql_ / ora-0 / SQLSTATE / unclosed quotation）
+      - SLEEP/BENCHMARK 延时注入产生可测延迟
+      - UNION SELECT 回显数据或列数差异
+    prove_required:
+      - payload 确实到达 SQL 执行点（无参数化/转义）
+      - 证据与 payload 有直接因果（报错/延迟/数据回显三者至少其一可复现）
+    false_positives:
+      - 响应差异仅来自正常业务分支或随机数据
+      - WAF 拦截页被误判为注入结果
+      - 延迟来自网络抖动（需基准对比）
+    check_steps:
+      - 逐参数测字符型(')与数字型(1-2)判断解析差异
+      - 布尔盲注 AND 1=1/1=2 观察响应长度差异
+      - 时间盲注 sleep(5) 三次取中位数排除抖动
+      - UNION SELECT 报列数/回显位并提取数据（库/表/字段）
+    knowledge_file: web-sqli.md
+    nuclei_tags: http/cves, http/vulnerabilities
+
+  - id: CWE-79
+    name: 跨站脚本 XSS
+    owasp: A03
+    kind: injection
+    trigger_signals:
+      - 输入原样回显在 HTML 且无编码
+      - 反射参数进入 <script>/事件属性/标签属性
+    prove_required:
+      - 闭合上下文成功且解析器级别成立（非纯文本节点）
+      - 触发可观测副作用（弹窗/外联/窃取 cookie 任一）
+    false_positives:
+      - 回显在纯文本节点且无闭合（不可利用）
+      - CSP 阻断脚本执行
+      - 仅自己可见的 self-XSS
+    check_steps:
+      - 找反射点，测 < > " ' & 编码情况
+      - 按回显位置选上下文：标签间/属性内/事件属性/js 上下文
+      - 构造最小 PoC 确认浏览器解析执行
+    knowledge_file: web-xss.md
+    nuclei_tags: http/cves
+
+  - id: CWE-78
+    name: 命令注入/执行 RCE
+    owasp: A03
+    kind: injection
+    trigger_signals:
+      - 参数拼接进系统命令（ping/whois/文件操作接口）
+      - 注入 ; | & ` $() 后出现命令执行痕迹
+    prove_required:
+      - 存在命令拼接且无白名单/转义
+      - 外联回调（dnslog/外带）或回显命令输出
+    false_positives:
+      - 输出仅为参数本身回显
+      - shell=False 或参数数组化的安全实现
+    check_steps:
+      - 识别命令型接口（ping/下载/转换类）
+      - 测分隔符 ; | & $( ) ` 与优先级绕过
+      - 外带验证：curl dnslog / ping 外联
+    knowledge_file: web-rce.md
+    nuclei_tags: http/cves
+
+  - id: CWE-98
+    name: 文件包含 LFI/RFI
+    owasp: A03
+    kind: file
+    trigger_signals:
+      - file/page/include 参数读取本地或远程文件
+      - php://filter / data:// / ../../etc/passwd 生效
+    prove_required:
+      - 参数真实接入包含函数（无扩展名强拼/白名单）
+      - 读到敏感文件内容（编码后也算）或执行代码
+    false_positives:
+      - 读固定文件与参数无关
+      - 返回404但实际是路由缺失
+    check_steps:
+      - 测本地文件读取 ../../etc/passwd 与 php://filter/base64
+      - 尝试日志投毒/伪协议(data://)转 RCE
+      - 确认文件内容真实回读（非固定页面）
+    knowledge_file: web-traversal.md
+    nuclei_tags: http/cves, http/vulnerabilities
+
+  - id: CWE-22
+    name: 路径穿越
+    owasp: A01
+    kind: file
+    trigger_signals:
+      - 下载/读取接口含文件名参数
+      - ../ 穿越后读到越权目录文件
+    prove_required:
+      - 无规范化/前缀校验
+      - 成功读越界文件（../etc/passwd 变体）
+    false_positives:
+      - 已做 realpath/白名单校验致读取失败
+    check_steps:
+      - 测 ../、..%2f、双写、绝对路径变体
+      - 测 Windows 反斜杠与盘符
+    knowledge_file: web-traversal.md
+    nuclei_tags: http/cves
+
+  - id: CWE-434
+    name: 任意文件上传
+    owasp: A03
+    kind: file
+    trigger_signals:
+      - 上传接口无类型/内容校验
+      - 双扩展/解析差异（.php.jpg / .phar / .phtml）
+    prove_required:
+      - webshell 落地且可访问解析执行
+      - 或覆盖关键文件造成影响
+    false_positives:
+      - 上传成功但目录不可执行/不解析
+      - 仅存储型无利用路径
+    check_steps:
+      - 测扩展名黑名单绕过（大小写/双写/多扩展）
+      - 测 content-type 与文件头绕过
+      - 落地后访问验证解析（回显/执行命令）
+    knowledge_file: web-upload.md
+    nuclei_tags: http/vulnerabilities
+
+  - id: CWE-918
+    name: SSRF 服务端请求伪造
+    owasp: A10
+    kind: ssrf
+    trigger_signals:
+      - 服务端发起 URL 请求功能（回显/跳转/回调）
+      - 请求打到内网/元数据地址返回特殊内容
+    prove_required:
+      - URL 完全或部分可控且无内网过滤
+      - 外联回调（dnslog）或读到 169.254 元数据
+    false_positives:
+      - 后端仅白名单域名
+      - 请求为浏览器侧发出（非服务端）
+    check_steps:
+      - 测 URL 指向外网探测回调
+      - 测 127.0.0.1/169.254.169.254/内网段
+    knowledge_file: web-ssrf-misc.md
+    nuclei_tags: http/vulnerabilities
+
+  - id: CWE-611
+    name: XXE 外部实体注入
+    owasp: A03
+    kind: injection
+    trigger_signals:
+      - 上传/交互 XML 格式数据（SOAP/office/配置导入）
+      - 回显实体内容或触发外联
+    prove_required:
+      - DTD 实体未被禁用且可控 XML
+      - 回显文件内容或外带数据
+    false_positives:
+      - 解析器禁用外部实体
+      - 报错仅展示泛化错误
+    check_steps:
+      - 提交带 DOCTYPE 的 XML 测 file:// 回显
+      - 测外带 OOB XXE 与盲 XXE 报错
+    knowledge_file: web-xxe.md
+    nuclei_tags: http/cves
+
+  - id: CWE-502
+    name: 不安全反序列化
+    owasp: A08
+    kind: injection
+    trigger_signals:
+      - 存在序列化数据入口（cookie/参数/文件格式）
+      - 构造恶意对象链触发行为差异
+    prove_required:
+      - 反序列化函数作用于不可信输入
+      - 触发 RCE/任意文件读等实际利用
+    false_positives:
+      - 仅白名单类型/输入来源可信
+      - 报错但未形成利用链
+    check_steps:
+      - 识别序列化格式与入口（php serialize/pickle/java）
+      - 构造 POP 链或原生 gadget 验证
+    knowledge_file: web-deser.md
+    nuclei_tags: http/cves
+
+  - id: CWE-200
+    name: 信息泄露（敏感文件/调试）
+    owasp: A05
+    kind: misc
+    trigger_signals:
+      - .git / .env / 备份文件 / phpinfo / actuator 可访问
+      - 报错泄露堆栈/路径/版本
+    prove_required:
+      - 读到的内容真实敏感（源码/密钥/凭据）
+    false_positives:
+      - 数据本就公开或已脱敏
+    check_steps:
+      - 探测 .git/HEAD、.env、.bak、www.zip 等
+      - 测报错信息泄露路径/版本→组件 CVE 对照
+    knowledge_file: web-leak.md
+    nuclei_tags: http/exposures
+
+  - id: CWE-287
+    name: 身份认证绕过
+    owasp: A07
+    kind: access-control
+    trigger_signals:
+      - 登录校验仅前端/参数可篡改
+      - 默认凭据/弱口令生效
+    prove_required:
+      - 未授权访问到需要认证的资源/接口
+    false_positives:
+      - 资源本身设计为公开
+    check_steps:
+      - 测默认口令/弱口令/万能密码
+      - 测参数篡改(admin=1)、Cookie 伪造、JWT 篡改
+    knowledge_file: web-logic-auth.md
+    nuclei_tags: http/vulnerabilities
+
+  - id: CWE-639
+    name: 越权访问 IDOR
+    owasp: A01
+    kind: access-control
+    trigger_signals:
+      - 对象 ID 可枚举且无归属校验
+      - 横向/纵向越权读取他人数据
+    prove_required:
+      - 用 B 身份读到 A 资源（同权限或低权限）
+    false_positives:
+      - 资源确属公开或已做归属校验
+    check_steps:
+      - 枚举对象 ID 测横向越权
+      - 低权限用户测纵向（管理员接口）
+    knowledge_file: web-logic-auth.md
+    nuclei_tags: http/vulnerabilities
+
+  - id: CWE-1336
+    name: 模板注入 SSTI
+    owasp: A03
+    kind: injection
+    trigger_signals:
+      - 输入被渲染进模板（邮件/错误页/预览）
+      - '{{7*7}} 等表达式求值输出 49'
+    prove_required:
+      - 模板引擎求值成立（数学/属性探测）
+      - 读取文件或执行命令
+    false_positives:
+      - 表达式被原样输出未被求值
+    check_steps:
+      - '测 {{7*7}} / ${7*7} 等各引擎语法'
+      - 求值成立后按引擎构造 RCE/文件读 payload
+    knowledge_file: web-rce.md
+    nuclei_tags: http/vulnerabilities
+
+  - id: CWE-93
+    name: CRLF 注入与 HTTP 走私
+    owasp: A03
+    kind: injection
+    trigger_signals:
+      - 响应头参数可注入 %0d%0a
+      - 新旧代理解析差异（走私）
+    prove_required:
+      - 注入额外头/分割响应成功
+      - 走私实现请求交叉或缓存投毒
+    false_positives:
+      - 输出经净化或代理统一规范化
+    check_steps:
+      - 测 header 注入 %0d%0aSet-Cookie
+      - 走私测 CL.TE / TE.CL 双请求差异
+    knowledge_file: web-modern-protocols.md
+    nuclei_tags: http/vulnerabilities

@@ -16,6 +16,7 @@ from .context import DeepAgentState, STEExperience, PlannerContext, ReflectorCon
 from .guard import AntiAddictionGuard
 from .mcp.executors.meta_executor import MetaToolExecutor
 from .memory import ContextCompressor
+from .agents import AgentOrchestrator
 
 logger = structlog.get_logger(__name__)
 
@@ -34,6 +35,135 @@ _SECKNOWLEDGE_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "knowledge", "reference", "secknowledge-skill",
 )
+
+# ── 确定性扫描器：nuclei 引擎（项目自包含，不在系统 PATH）──────────────
+# 引擎与模板库均固定指向项目内路径（模板不依赖 AppData 默认目录，可随仓库分发）
+_TOOLS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools",
+)
+_NUCLEI_BIN = os.path.join(_TOOLS_DIR, "nuclei.exe")
+_FFUF_BIN = os.path.join(_TOOLS_DIR, "ffuf.exe")
+_NUCLEI_TEMPLATES = os.path.join(
+    os.path.dirname(_SECKNOWLEDGE_DIR), "nuclei-templates",
+)
+
+# CWE 模式库目录（§5.3 模式条目：触发特征/需证明/误报原因/检查步骤，
+# Finder/Planner 逐类质问清单的数据源；与 secknowledge 手册互补）
+_CWE_PATTERNS_DIR = os.path.join(
+    os.path.dirname(_SECKNOWLEDGE_DIR), "cwe-patterns",
+)
+
+_cwe_patterns_cache: Optional[List[Dict[str, Any]]] = None
+
+
+def _load_cwe_patterns() -> List[Dict[str, Any]]:
+    """加载 CWE 模式库（目录下所有 yaml），进程内缓存。失败静默返回空列表。"""
+    global _cwe_patterns_cache
+    if _cwe_patterns_cache is not None:
+        return _cwe_patterns_cache
+    import yaml
+    patterns: List[Dict[str, Any]] = []
+    try:
+        for fname in sorted(os.listdir(_CWE_PATTERNS_DIR)):
+            if not fname.lower().endswith((".yaml", ".yml")):
+                continue
+            with open(os.path.join(_CWE_PATTERNS_DIR, fname), encoding="utf-8") as fh:
+                data = yaml.safe_load(fh) or {}
+            for p in (data.get("patterns") or []):
+                if isinstance(p, dict) and p.get("id"):
+                    patterns.append(p)
+    except Exception as e:
+        logger.warning("cwe_patterns_load_failed", error=str(e))
+    _cwe_patterns_cache = patterns
+    return patterns
+
+
+def _patterns_for_focus(vuln_focus: str, limit: int = 2) -> List[Dict[str, Any]]:
+    """按 OWASP 方向（前缀 A01-A10）路由匹配的 CWE 模式条目。"""
+    key = (vuln_focus or "").strip()[:3]
+    if not key:
+        return []
+    matched = [
+        p for p in _load_cwe_patterns()
+        if key in str(p.get("owasp", "")).replace(" ", "").split(",")
+    ]
+    return matched[:limit]
+
+
+def _normalize_threat_model(tm: Any) -> Optional[Dict[str, Any]]:
+    """归一化威胁模型（§4）：字段校验、入口点按 method+url 去重、限量。
+    无任何有效内容返回 None，不存档（静默降级，不影响主流程）。"""
+    if not isinstance(tm, dict):
+        return None
+    assets = [str(a).strip()[:80] for a in (tm.get("assets") or []) if str(a).strip()][:12]
+    tbs: List[Dict[str, str]] = []
+    for b in (tm.get("trust_boundaries") or [])[:8]:
+        if isinstance(b, dict) and (b.get("name") or b.get("desc")):
+            tbs.append({"name": str(b.get("name", "")).strip()[:40],
+                        "desc": str(b.get("desc", "")).strip()[:80]})
+        elif isinstance(b, str) and b.strip():
+            tbs.append({"name": b.strip()[:40], "desc": ""})
+    tbs = tbs[:6]
+    eps: List[Dict[str, Any]] = []
+    _seen: set = set()
+    for e in (tm.get("entry_points") or [])[:16]:
+        if not isinstance(e, dict) or not e.get("url"):
+            continue
+        url = str(e.get("url", "")).strip()[:200]
+        method = (str(e.get("method", "GET")).strip().upper() or "GET")[:10]
+        key = (method, url)
+        if key in _seen:
+            continue
+        _seen.add(key)
+        eps.append({
+            "id": (str(e.get("id", "")).strip() or f"EP{len(eps) + 1}")[:12],
+            "url": url,
+            "method": method,
+            "params": [str(p).strip()[:40] for p in (e.get("params") or []) if str(p).strip()][:6],
+            "auth_required": bool(e.get("auth_required")),
+            "reachable": bool(e.get("reachable", True)),
+        })
+    eps = eps[:12]
+    ce = [str(c).strip()[:100] for c in (tm.get("counterexamples") or []) if str(c).strip()][:6]
+    if not (assets or tbs or eps):
+        return None
+    return {"assets": assets, "trust_boundaries": tbs,
+            "entry_points": eps, "counterexamples": ce}
+
+# nmap 非项目内自包含（winget 安装，位置随机器而异）：环境变量覆盖 > PATH > 候选列表
+_NMAP_CANDIDATES = (
+    os.path.join(_TOOLS_DIR, "nmap.exe"),
+    r"E:\笔记\工具\Nmap\nmap.exe",
+    r"C:\Program Files (x86)\Nmap\nmap.exe",
+)
+
+
+def _nuclei_available() -> bool:
+    """nuclei 引擎 + 项目内模板库是否可用（为"确定性扫描器做种子"提供能力检测）。"""
+    return os.path.exists(_NUCLEI_BIN) and os.path.isdir(_NUCLEI_TEMPLATES)
+
+
+def _ffuf_available() -> bool:
+    return os.path.exists(_FFUF_BIN)
+
+
+def _nmap_path() -> Optional[str]:
+    """解析 nmap.exe 路径：NMAP_BIN 环境变量 > 系统 PATH > 候选目录。找不到返回 None。"""
+    import shutil
+    env = os.environ.get("NMAP_BIN")
+    if env and os.path.exists(env.strip().strip('"')):
+        return env.strip().strip('"')
+    sys_p = shutil.which("nmap")
+    if sys_p:
+        return sys_p
+    for c in _NMAP_CANDIDATES:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def _nmap_available() -> bool:
+    return _nmap_path() is not None
 
 # OWASP 方向 → secknowledge 参考文件（确定性注入映射：Planner 不再依赖
 # "自觉 cat"，服务端按当前方向直接把对应手册的 payload/绕过片段喂进提示词）
@@ -62,8 +192,14 @@ _SKILL_KEYWORD_FILES = [
     ("log|日志", "web-modern-protocols.md"),
 ]
 
+# ── 对抗式验证 / Finding 机器校验 / 复现协议已迁入独立裁决角色
+#    VerifierAgent（agents.py，形态 D 多 Agent）：证伪者提示词、多路多数
+#    裁定、机器硬校验与 L1/L2 定级由 reflector 节点经编排器调用 ─────────
 
-async def _llm_invoke_with_retry(llm, prompt: str, max_retries: int = 4, temperature: Optional[float] = None, fast: bool = False) -> str:
+
+async def _llm_invoke_with_retry(llm, prompt: str, max_retries: int = 4, temperature: Optional[float] = None,
+                                 fast: bool = False, model: Optional[str] = None,
+                                 api_key: Optional[str] = None, base_url: Optional[str] = None) -> str:
     """调用 LLM，每次创建全新客户端（防止代理积累对话上下文），遇到网络错误时指数退避重试。
 
     provider 由 LLM_PROVIDER 选择：anthropic（默认，原生 Anthropic SDK）或
@@ -73,6 +209,9 @@ async def _llm_invoke_with_retry(llm, prompt: str, max_retries: int = 4, tempera
 
     fast=True（Reflector/STE 等高频判定调用）时优先使用 LLM_FAST_MODEL /
     LLM_FAST_API_KEY / LLM_FAST_BASE_URL（快速小模型分流，未配置则原样回退）。
+
+    model/api_key/base_url 为角色级显式覆盖（多 Agent 形态 D：独立裁决/报告
+    Agent 传入自身 LLM 配置），非空才覆盖、优先级最高（可盖过 fast 分流）。
     """
     _provider = (os.environ.get("LLM_PROVIDER") or "anthropic").strip().strip("'\"").lower() or "anthropic"
     _is_anthropic = _provider == "anthropic"
@@ -92,6 +231,13 @@ async def _llm_invoke_with_retry(llm, prompt: str, max_retries: int = 4, tempera
         _api_key = _fast_key or _api_key
         _base_url = _fast_base or _base_url
         _model = _fast_model
+    # ── 角色级显式覆盖（独立 Agent 用）：非空才覆盖，优先级最高（可盖过 fast）──
+    if model:
+        _model = model.strip().strip("'\"")
+    if api_key:
+        _api_key = api_key.strip().strip("'\"")
+    if base_url:
+        _base_url = base_url.strip().strip("'\"")
     _max_tok  = int(os.environ.get("LLM_MAX_TOKENS", "16384"))
     # temperature 可按调用点覆盖：判定类调用（Reflector/方向预筛）传低温减少随机性
     _temp     = float(os.environ.get("LLM_TEMPERATURE", "0.7")) if temperature is None else float(temperature)
@@ -318,6 +464,10 @@ class DeepAgentGraph:
         self.meta_executor = MetaToolExecutor(tools)
         self.guard = AntiAddictionGuard()
 
+        # ── 多 Agent 编排器（形态 D）：独立裁决（verifier）/报告（reporter）角色，
+        #    由 reflector/summarizer 节点调用；meta_executor 供复现协议复用 ──
+        self.orchestrator = AgentOrchestrator(llm=llm, meta_executor=self.meta_executor)
+
         # 会话内已执行任务指纹（工具+参数精确匹配）：执行前硬去重，
         # 同质任务连代码生成/执行都跳过，节省轮次与 LLM token
         self._exec_fingerprints: deque = deque(maxlen=40)
@@ -400,6 +550,25 @@ class DeepAgentGraph:
             _last_desc,
         )
 
+        # ── CWE 模式质问清单（§5.3 用法1）：按当前方向路由模式条目注入。
+        #    tasks 必须逐条对照 check_steps 生成；证明不齐的只能标假设 ──
+        pattern_hint = ""
+        _pats = _patterns_for_focus(state.planner.current_vuln_focus or "")
+        if _pats:
+            _pl: List[str] = []
+            for p in _pats:
+                _pl.append(
+                    f"◆ {p.get('id')} {p.get('name', '')}（payload 出处: {p.get('knowledge_file', '')}）\n"
+                    f"  质问清单: {'; '.join(str(s) for s in (p.get('check_steps') or [])[:6])}\n"
+                    f"  必证: {'; '.join(str(s) for s in (p.get('prove_required') or [])[:4])}\n"
+                    f"  误报自检: {'; '.join(str(s) for s in (p.get('false_positives') or [])[:3])}"
+                )
+            pattern_hint = (
+                "\n━━━ CWE 模式质问清单（当前方向的机器清单，本方向 tasks 必须逐条"
+                "对照生成测试；命中触发特征才可提假设，必证项不齐的仅写 suspected）━━━\n"
+                + "\n".join(_pl) + "\n"
+            )
+
         # ── 利用链进度：跨轮要素沉淀，多步利用的下一跳必须基于已有要素 ──
         chain_hint = ""
         if state.planner.chain_notes:
@@ -445,6 +614,54 @@ class DeepAgentGraph:
                 "\n━━━ 上轮反思建议的下一跳候选（优先采纳，除非有更强理由）━━━\n"
                 + "\n".join(f"  · {str(s)[:160]}" for s in _sns[:3]) + "\n"
             )
+
+        # ── 确定性扫描种子（nuclei 预扫命中，规划起点：机器枚举打底）────
+        scan_hint = ""
+        if state.planner.scan_seeds:
+            _sl = []
+            for s in state.planner.scan_seeds[:12]:
+                _ev = str(s.get("evidence", ""))[:60]
+                _sl.append(
+                    f"· [{s.get('kind')}] {str(s.get('desc'))[:100]}"
+                    + (f" | {_ev}" if _ev else "")
+                )
+            scan_hint = (
+                "\n━━━ 确定性扫描种子（nuclei 预扫已命中，规划必须优先利用："
+                "端点/技术栈/CVE 假设直接基于种子构造，禁止重新盲目探测同一目标）━━━\n"
+                + "\n".join(_sl) + "\n"
+            )
+
+        # ── 威胁建模（§4）：首轮产出的攻击面切片，后续轮任务必须钉住入口点 ──
+        threat_hint = ""
+        _tm = state.planner.threat_model
+        if isinstance(_tm, dict):
+            _tl: List[str] = []
+            if _tm.get("assets"):
+                _tl.append("资产: " + "；".join(str(a)[:60] for a in _tm["assets"][:10]))
+            if _tm.get("trust_boundaries"):
+                _tl.append("信任边界: " + "；".join(
+                    (f"{b['name']}({b['desc']})" if b.get("desc") else b["name"])
+                    for b in _tm["trust_boundaries"][:6]))
+            _eps = [e for e in (_tm.get("entry_points") or []) if isinstance(e, dict)]
+            def _ep_str(e: Dict[str, Any]) -> str:
+                _ps = e.get("params") or []
+                return (f"{e.get('id','?')} {e.get('method','GET')} {str(e.get('url',''))[:70]}"
+                        + (f" | 参数:{','.join(str(p) for p in _ps[:4])}" if _ps else ""))
+            _pub = [e for e in _eps if not e.get("auth_required")]
+            _priv = [e for e in _eps if e.get("auth_required")]
+            if _pub:
+                _tl.append("未认证入口: " + "；".join(_ep_str(e) for e in _pub[:8]))
+            if _priv:
+                _tl.append("需认证入口(先攻 A07/凭据): " + "；".join(_ep_str(e) for e in _priv[:8]))
+            if _tm.get("counterexamples"):
+                _tl.append("反例假设(优先设计证伪实验): " + "；".join(
+                    str(c)[:60] for c in _tm["counterexamples"][:6]))
+            if _tl:
+                threat_hint = (
+                    "\n━━━ 威胁模型（首轮产出的攻击面切片，本轮任务必须钉住具体入口点并在"
+                    "description 标注 EP#；未破的入口点禁止重复盲测同一参数）━━━\n"
+                    + "\n".join(f"  · {l}" for l in _tl) + "\n"
+                )
 
         # ── 用户实时纠偏/补充（steer）：运行中追加的指令，本轮必须纳入 ──
         steering_hint = ""
@@ -591,13 +808,14 @@ class DeepAgentGraph:
     "total_rounds": 6,
     "rounds_adjust": 0,
     "test_plan": {{"objective": "目标一句话", "directions": [{{"direction": "A03-SQL注入", "cases": [{{"id": "A03-1", "desc": "用例说明+payload要点", "status": "pending"}}]}}]}},
+    "threat_model": {{"assets": ["核心资产"], "trust_boundaries": [{{"name": "边界名", "desc": "说明"}}], "entry_points": [{{"id": "EP1", "url": "/login", "method": "POST", "params": ["username"], "auth_required": false, "reachable": true}}], "counterexamples": ["自认安全待证伪的假设"]}},
     "test_analysis": {{"response_pattern": "上轮响应差异", "failure_reason": "失效原因", "new_angles": ["角度1", "角度2"]}},
     "tasks": [{{"tool": "工具名", "arguments": {{"参数": "值"}}, "description": "测试值 + 预期观测点"}}],
     "reasoning": "综合判断",
     "vuln_focus": "当前 OWASP 方向（如 A03-SQL注入）",
     "tried_summary": "本轮测试摘要"
 }}
-字段说明: plan_mode=当前模式({_plan_mode}); total_rounds 仅 init 填写(2-{self.max_iterations}轮，规划总思考轮数，仅为参考基线); rounds_adjust=轮数增减申请(-2~+2整数，默认0，须基于轮数建议与文档进展，reasoning 中说明理由); test_plan 在 init/update 必须输出【完整文档】，final 可省略; 其余字段每轮必填。"""
+字段说明: plan_mode=当前模式({_plan_mode}); total_rounds 仅 init 填写(2-{self.max_iterations}轮，规划总思考轮数，仅为参考基线); rounds_adjust=轮数增减申请(-2~+2整数，默认0，须基于轮数建议与文档进展，reasoning 中说明理由); test_plan 在 init/update 必须输出【完整文档】，final 可省略; threat_model 仅 init 必填（资产/信任边界/入口点 EP1..EPn/反例假设），update/final 省略; tasks[].depends_on 可选(1-based 位置指向本 tasks 列表前置任务，如浏览器核验任务依赖扫描任务；无依赖的任务并行执行，依赖满足后才启动); 其余字段每轮必填。"""
 
         prompt = f"""你是一名安全评估工程师，对授权目标执行安全合规性检查。
 
@@ -616,7 +834,7 @@ class DeepAgentGraph:
 总轮数基线: {_plan_total}（已执行 {state.execution_round} 轮，剩余 {_plan_total - state.execution_round} 轮）
 上轮轮数建议: {_rounds_suggestion_str}
 模式要求（强制）:
-  · init（第一轮）: 先生成完整测试文档——对每个适用方向列出至少3个用例（id=方向缩写-序号，desc=测试点+payload要点，status 固定 pending），并确定 total_rounds（2-{self.max_iterations} 轮内，按目标复杂度建议 4-8 轮）。tasks 必须从文档第一批用例生成，不得偏离文档。
+  · init（第一轮）: 【第一步】先产出威胁模型 threat_model——结合目标 URL、扫描种子与侦察结果推断并明确：①资产（值得拿下的数据/功能）；②信任边界（未认证→认证、普通用户→管理员等）；③入口点清单（未认证可直达的优先，需认证的标 auth_required=true；每个入口给 id=EP#、method、params）；④反例假设（自认为安全、设计上"不可能"的点，留给后续轮证伪）。【第二步】再按入口点切分攻击面生成完整测试文档——对每个适用方向列出至少3个用例（id=方向缩写-序号，desc=测试点+payload要点+目标入口点 EP#，status 固定 pending），并确定 total_rounds（2-{self.max_iterations} 轮内，按目标复杂度建议 4-8 轮）。tasks 必须从文档第一批用例生成，description 标注目标 EP#/入口，不得偏离文档。
   · update（中间轮）: 必须输出修订后的【完整】test_plan——将上轮已执行用例的 status 更新为 done/found/failed（found=确认漏洞，需在 desc 标注证据摘要），允许新增用例（新 id 按方向顺延），禁止删除已有用例。tasks 继续执行文档中 status=pending 且价值最高的用例。首轮 total_rounds 仅为参考基线：结合文档进度与上轮轮数建议，通过 rounds_adjust（-2~+2）动态增减总轮数（进展显著/pending 充足→正值；连续无发现/剩余用例低价值→负值），调整理由写入 reasoning。
   · final（最后一轮）: 只输出收尾验证 tasks——聚焦文档中最可能有突破的 pending 用例与 found 用例的深挖确认；test_plan 可省略。本轮结束后系统自动进入总结节点生成最终报告。
 
@@ -628,7 +846,7 @@ class DeepAgentGraph:
 已停滞: {state.planner.stalled_directions}
 被拒策略: {json.dumps(_rejected_brief, ensure_ascii=False)[:100]}
 {"历史经验: " + "; ".join(state.planner.long_term_goals[:3]) if state.planner.long_term_goals else ""}
-{_dup_brief}{tried_payloads_hint}{same_output_hint}{kb_hint}{skill_hint}{chain_hint}{asset_hint}{next_hops_hint}{steering_hint}{pivot_instruction}
+{_dup_brief}{tried_payloads_hint}{same_output_hint}{kb_hint}{skill_hint}{pattern_hint}{chain_hint}{scan_hint}{threat_hint}{asset_hint}{next_hops_hint}{steering_hint}{pivot_instruction}
 
 ━━━ OWASP Top10（逐一测试，3轮无果换方向）━━━
 {state.planner.applicable_directions or 'A01-访问控制 | A02-加密失败 | A03-SQL注入 | A04-不安全设计 | A05-安全配置错误 | A06-已知漏洞组件 | A07-身份认证失败 | A08-完整性失败 | A09-日志缺失 | A10-SSRF'}
@@ -646,6 +864,12 @@ class DeepAgentGraph:
   空间测绘(FOFA/Quake):         cat "{_RECON_PLAYBOOK_DIR}/05-cyberspace-search.md"
   JS 端点/敏感信息:             cat "{_RECON_PLAYBOOK_DIR}/06-analyze-js.md"
   鉴权绕过 Fuzz:                cat "{_RECON_PLAYBOOK_DIR}/07-fuzz-auth-bypass.md"
+  确定性漏洞指纹扫描(nuclei):   & "{_NUCLEI_BIN}" -t "{_NUCLEI_TEMPLATES}\\http" -u <目标URL> -duc -silent -c 10 -timeout 15
+    子集按需指定: -t "...\\http\\technologies"（指纹） / -t "...\\http\\cves"（CVE 对照） / -t "...\\http\\exposures"（暴露面）
+    铁律: 引擎与模板只用上述项目内路径，禁止 -update-templates 或使用 AppData 默认目录；命中项仅作种子假设，仍须手动验证。
+  端口扫描引擎(nmap):           & "{_nmap_path() or 'nmap'}" -sV -Pn --top-ports 100 <目标host>
+  目录爆破引擎(ffuf):           & "{_FFUF_BIN}" -w <字典文件> -u <目标URL>/FUZZ -mc 200,301,302,403 -t 8 -timeout 10
+    ffuf 字典: 项目无内置字典时先用 execute_python 写 ≤200 条常见路径小字典到临时文件再 -w 引用；禁大字典高并发
 
 ━━━ 漏洞知识库（SKILL.md 是主要参考/查询笔记，禁止凭印象编造 payload）━━━
 定位流程（构造任何 Payload/绕过前强制执行）:
@@ -667,6 +891,7 @@ class DeepAgentGraph:
 ━━━ 规划原则（强制执行）━━━
 1. 【分析】test_analysis 必须说明：上轮响应差异、失效原因、≥3种新角度
 2. 【覆盖】每轮5-8个任务，不同技术手法，每个description含具体测试值+预期观测点
+2b. 【多模态】每轮任务铺开≥2种模态并行推进：execute_python 主动HTTP探测 / execute_shell 确定性扫描(ffuf·nuclei) / browser 可视化验证(登录·整页渲染·XSS弹窗) / knowledge 检索。同方向用不同模态交叉验证，比单一模态单点深测更高效
 3. 【代码】execute_python/execute_shell ≤8行，示例: import httpx; r=httpx.post('URL',data={{'p':'1 OR 1=1'}},timeout=10,verify=False); print(r.status_code,r.text[:3000])
 4. 【变换】发现过滤后输出≥3种变换方案（大小写/注释/编码/等价函数/切换注入类型）
 5. 【深挖】SQL注入确认后必须提取数据（库/表/字段/flag），使用完整查询
@@ -698,6 +923,16 @@ class DeepAgentGraph:
                         for _d in tp.get("directions", []):
                             for _c in _d.get("cases", []):
                                 _c["status"] = "pending"
+
+                    # ── 威胁建模（§4）：首轮强制产出，归一化后存档，后续轮注入攻击面切片 ──
+                    _tm = _normalize_threat_model(plan.get("threat_model"))
+                    if _tm:
+                        state.planner.threat_model = _tm
+                        logger.info("threat_model_stored",
+                                    assets=len(_tm.get("assets") or []),
+                                    entry_points=len(_tm.get("entry_points") or []))
+                    else:
+                        logger.warning("threat_model_missing_or_invalid", round=1)
 
                 # 测试文档：init 生成 / update 修订（完整覆盖式更新）
                 tp = plan.get("test_plan")
@@ -823,12 +1058,13 @@ class DeepAgentGraph:
         ]
 
     async def _executor_node(self, state: DeepAgentState) -> DeepAgentState:
-        """执行节点 - 依赖排序后并行执行任务。
+        """执行节点 - 依赖排序后多模态并行执行任务（§8 Finder）。
 
         并行策略：
         - 预检阶段串行（guard 防沉迷 + 指纹硬去重，保证检查逻辑顺序一致）
-        - 执行阶段：无状态工具（execute_python/knowledge_*）并发（信号量 3）；
-          有状态工具（execute_shell/browser_*/proxy_*）共享会话，串行队列。
+        - 执行阶段按模态分道：无状态工具（execute_python/knowledge_*）信号量 3 并发；
+          shell/browser/proxy 各为一条串行道（守护各自会话，互不共享状态），
+          跨模态并行推进（如 HTTP 探测 + 目录爆破 + 浏览器验证同轮同时进行）。
         - 一轮内 ≥2 个任务回显相同 → 强制 pivot，避免同质任务烧轮次。
         """
         state = _normalize_state(state)
@@ -869,34 +1105,57 @@ class DeepAgentGraph:
             self._exec_fingerprints.append(fp)
             pending.append(task)
 
-        # ── 执行阶段（并行）──
-        # 无状态可并发工具；其他（shell/browser/proxy 共享会话）串行
+        # ── 执行阶段（§8 Finder 多模态并行）──
+        # 模态分道：各模态内部串行（守护自有会话），跨模态并行（互不共享状态）。
+        #   · stateless 道（execute_python/knowledge_*）：无会话，信号量 3 并发
+        #   · shell 道（execute_shell）：PowerShell REPL 单一终端会话 → 串行
+        #   · browser 道（browser_*）：单一浏览器页面会话 → 串行
+        #   · proxy 道（proxy_*）：Caido 代理 API → 串行（请求可并发但保持顺序可读）
+        #   · 未知工具 → 全局保守串行（不并发不冒险）
         _PARALLEL_TOOLS = {"execute_python", "knowledge_search", "knowledge_get_detail", "knowledge_save"}
         # 各工具的超时上限（秒）：快失败避免单任务拖死整轮
         _TOOL_TIMEOUTS = {
             "execute_python": 150, "execute_shell": 90, "browser_navigate": 120,
             "browser_execute_js": 60, "browser_get_content": 60, "browser_screenshot": 60,
             "knowledge_search": 45, "knowledge_get_detail": 45, "knowledge_save": 45,
+            "proxy_list_traffic": 60, "proxy_get_flow": 60, "proxy_clear_traffic": 60,
+            "proxy_replay_flow": 60,
         }
+
+        def _modality(tool: str) -> str:
+            if tool in _PARALLEL_TOOLS:
+                return "stateless"
+            if tool == "execute_shell":
+                return "shell"
+            if str(tool).startswith("browser_"):
+                return "browser"
+            if str(tool).startswith("proxy_"):
+                return "proxy"
+            return "stateful"
+
         _sem = asyncio.Semaphore(3)
-        _serial_lock = asyncio.Lock()
+        _lane_locks = {
+            "shell": asyncio.Lock(),
+            "browser": asyncio.Lock(),
+            "proxy": asyncio.Lock(),
+            "stateful": asyncio.Lock(),
+        }
 
         async def run_one(task: Dict[str, Any]) -> Dict[str, Any]:
             tool = str(task.get("tool") or "")
             timeout = _TOOL_TIMEOUTS.get(tool, self.meta_executor.timeout)
-            if tool in _PARALLEL_TOOLS:
-                async with _sem:
-                    try:
+            lane = _modality(tool)
+            try:
+                if lane == "stateless":
+                    async with _sem:
                         result = await asyncio.wait_for(self.meta_executor.execute(task), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        result = {"success": False, "error": f"任务超时（>{timeout}s）"}
-            else:
-                async with _serial_lock:
-                    try:
+                else:
+                    async with _lane_locks[lane]:
                         result = await asyncio.wait_for(self.meta_executor.execute(task), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        result = {"success": False, "error": f"任务超时（>{timeout}s）"}
+            except asyncio.TimeoutError:
+                result = {"success": False, "error": f"任务超时（>{timeout}s）"}
             result["task"] = task
+            result["modality"] = lane
 
             # ── 回显相同检测 ──────────────────────────────────────────────
             output_text = ""
@@ -915,8 +1174,34 @@ class DeepAgentGraph:
             return result
 
         if pending:
-            exec_results = await asyncio.gather(*(run_one(t) for t in pending))
-            results.extend(exec_results)
+            # ── 依赖波次调度：同波多模态并行，波间串行 ──────────────────
+            # depends_on 为 1-based 位置（指向 Planner 原始任务列表），引用任务
+            # 完成（无论成败）后才启动依赖任务；引用被去重跳过/成环 → 兜底整波执行
+            def _deps_of(t: Dict[str, Any]) -> List[int]:
+                d = t.get("depends_on")
+                if isinstance(d, int):
+                    return [d]
+                if isinstance(d, (list, tuple)):
+                    return [x for x in d if isinstance(x, int)]
+                return []
+
+            _pos1 = {id(t): i + 1 for i, t in enumerate(state.current_tasks)}
+            _assigned: set = set()
+            while len(_assigned) < len(pending):
+                wave = [t for t in pending if id(t) not in _assigned
+                        and all(any(_pos1.get(done) == d for done in _assigned)
+                                for d in _deps_of(t))]
+                if not wave:  # 环/引用已跳过任务 → 剩余任务整波兜底
+                    wave = [t for t in pending if id(t) not in _assigned]
+                for t in wave:
+                    _assigned.add(id(t))
+                exec_results = await asyncio.gather(*(run_one(t) for t in wave))
+                results.extend(exec_results)
+                # 分道统计：让 Planner/Reflector 侧日志可见各模态路径的产出分布
+                _lane_count: Dict[str, int] = {}
+                for r in exec_results:
+                    _lane_count[r.get("modality", "?")] = _lane_count.get(r.get("modality", "?"), 0) + 1
+                logger.info("executor_lanes_done", wave_size=len(wave), lanes=_lane_count)
 
         # ── 同质化硬信号：一轮 ≥2 个相同回显 → 强制换向 ──────────────────
         same_out_count = sum(1 for r in results if r.get("same_output_warning"))
@@ -957,14 +1242,102 @@ class DeepAgentGraph:
             state.reflector.add_reflection(reflection)
             state.planner.latest_reflection = reflection
 
+            # ── 对抗式验证（VerifierAgent 独立裁决角色）+ Finding 机器校验 ──
+            # 模型只当"提出者"：confirmed 候选交独立裁决 Agent——证伪陪审团
+            # (SURVIVED) → 机器硬校验（字段完备性 + L1/L2 定级）→ 复现协议；
+            # 任一关不过即驳回降级。
+            _cand = reflection.get("confirmed_vuln")
+            _refute_record: Dict[str, Any] | None = None
+            _machine_check: Dict[str, Any] | None = None
+            if _cand and reflection.get("finding_level") == "confirmed":
+                _cand["round"] = state.execution_round
+                if _cand.get("vuln_type"):
+                    _cand["vuln_type"] = _norm_dir(_cand["vuln_type"])
+
+                _verdict = await self.orchestrator.verifier.evaluate(_cand, state.current_results)
+
+                # 回写为持久化 dict（下游 _survived 判定 / chain_notes /
+                # summarizer 依赖这些键名与嵌套结构，必须与旧结构一致）
+                if _verdict.refutation:
+                    _refute_record = {
+                        "verdict": _verdict.refutation.verdict,
+                        "rebuttal": str(_verdict.refutation.rebuttal)[:200],
+                        "votes": _verdict.refutation.votes,
+                    }
+                    _cand["refute"] = _refute_record
+                if _verdict.machine_check:
+                    _machine_check = _verdict.machine_check.model_dump()
+
+                if _verdict.verdict == "REFUTED":
+                    # 证伪者多数裁定驳回
+                    _cand["refute_reason"] = str(
+                        (_verdict.refutation.refuted_check
+                         if _verdict.refutation else "")
+                        or (_verdict.refutation.rebuttal
+                            if _verdict.refutation else "") or ""
+                    )[:200]
+                    state.planner.suspected_vulns.append(_cand)
+                    reflection["finding_level"] = "suspected"
+                    logger.warning(
+                        "vuln_refuted_downgraded",
+                        vuln_type=_cand.get("vuln_type"),
+                        rebuttal=str(_verdict.refutation.rebuttal)[:100]
+                        if _verdict.refutation else "",
+                    )
+                else:
+                    # SURVIVED → Finding 机器校验关卡：缺席项即驳回，通过定级 L1/L2
+                    _cand["machine_check"] = _machine_check
+                    if not _machine_check or not _machine_check["passed"]:
+                        _cand["machine_reject"] = (_machine_check or {}).get("problems", [])
+                        state.planner.suspected_vulns.append(_cand)
+                        reflection["finding_level"] = "suspected"
+                        logger.warning(
+                            "vuln_machine_rejected",
+                            vuln_type=_cand.get("vuln_type"),
+                            problems=(_machine_check or {}).get("problems", []),
+                        )
+                    else:
+                        _cand["confidence_level"] = _verdict.confidence_level
+                        # ── 复现协议：重放候选代码验证证据可重现；
+                        #    L1 无复现证据 → 自动降 L2（文章 §7 机器规则）──
+                        _poc = _verdict.poc
+                        _cand["poc"] = _poc
+                        if _cand["confidence_level"] == "L1" and not _poc.get("reproduced"):
+                            _cand["confidence_level"] = "L2"
+                            _poc["auto_downgraded"] = "L1->L2: 无复现证据"
+                            logger.info(
+                                "poc_not_reproduced_downgraded",
+                                vuln_type=_cand.get("vuln_type"),
+                                reason=str(_poc.get("reason"))[:100],
+                            )
+
             # ── 利用链进度沉淀：关键发现 + 确认证据写入 chain_notes，
             #    供下一轮 Planner 基于已有要素继续构造多步利用──────
             _chain_new: List[str] = []
             if reflection.get("finding_level") == "confirmed" and reflection.get("confirmed_vuln"):
                 cv = reflection["confirmed_vuln"]
                 _chain_new.append(
-                    f"[R{state.execution_round + 1}] 确认 {str(cv.get('vuln_type', ''))[:40]}: "
-                    f"{str(cv.get('proof_brief', ''))[:120]} | payload: {str(cv.get('payload', ''))[:120]}"
+                    f"[R{state.execution_round + 1}] 确认(SURVIVED/{cv.get('confidence_level', 'L2')}) "
+                    f"{str(cv.get('vuln_type', ''))[:36]}: {str(cv.get('proof_brief', ''))[:110]}"
+                    f" | payload: {str(cv.get('payload', ''))[:110]}"
+                )
+                if cv.get("poc"):
+                    _poc = cv["poc"]
+                    _chain_new.append(
+                        f"[R{state.execution_round + 1}] 复现验证: "
+                        f"{'通过' if _poc.get('reproduced') else '未通过: ' + str(_poc.get('reason', ''))[:60]}"
+                    )
+            elif reflection.get("confirmed_vuln") and _refute_record and _refute_record.get("verdict") == "REFUTED":
+                cv = reflection["confirmed_vuln"]
+                _chain_new.append(
+                    f"[R{state.execution_round + 1}] 候选被证伪: {str(cv.get('vuln_type', ''))[:40]} "
+                    f"| 反驳: {str(cv.get('refute_reason', ''))[:120]}"
+                )
+            elif reflection.get("confirmed_vuln") and _machine_check and not _machine_check.get("passed"):
+                cv = reflection["confirmed_vuln"]
+                _chain_new.append(
+                    f"[R{state.execution_round + 1}] 候选被机器校验驳回: {str(cv.get('vuln_type', ''))[:40]} "
+                    f"| 原因: {'; '.join(str(p) for p in cv.get('machine_reject', []))[:120]}"
                 )
             for f in (reflection.get("key_findings") or [])[:4]:
                 _chain_new.append(f"[R{state.execution_round + 1}] {str(f)[:150]}")
@@ -1013,8 +1386,15 @@ class DeepAgentGraph:
                 state.planner.evidence_vault = (state.planner.evidence_vault + _new_ev)[-24:]
 
             # 确认漏洞 → 写入 confirmed_vulns，并标记方向完成、触发 pivot
+            # 对抗式验证关卡：仅证伪者判 SURVIVED 的候选允许进入 confirmed_vulns
             confirmed_vuln = reflection.get("confirmed_vuln")
-            if confirmed_vuln and reflection.get("finding_level") == "confirmed":
+            _survived = (
+                confirmed_vuln
+                and reflection.get("finding_level") == "confirmed"
+                and (confirmed_vuln.get("refute") or {}).get("verdict") == "SURVIVED"
+                and (confirmed_vuln.get("machine_check") or {}).get("passed") is True
+            )
+            if _survived:
                 confirmed_vuln["round"] = state.execution_round
                 if confirmed_vuln.get("vuln_type"):
                     confirmed_vuln["vuln_type"] = _norm_dir(confirmed_vuln["vuln_type"])
@@ -1109,194 +1489,15 @@ class DeepAgentGraph:
         return state
 
     async def _summarizer_node(self, state: DeepAgentState) -> DeepAgentState:
-        """收尾节点 - 在轮次结束前调用 LLM 生成完整测试总结报告，结果存入 state.final_report。"""
+        """收尾节点 - 报告生成委托给独立 ReporterAgent（形态 D 多 Agent：报告权
+        独立于主流程），LLM 失败时 ReporterAgent 内部回退纯文本兜底报告，
+        结果存入 state.final_report。"""
         state = _normalize_state(state)
         logger.info("summarizer_start", round=state.execution_round,
                     confirmed=len(state.planner.confirmed_vulns))
 
-        # 已确认漏洞详情（限 1500 字符）
-        confirmed_detail = json.dumps(
-            state.planner.confirmed_vulns, ensure_ascii=False, indent=2
-        )[:1500] if state.planner.confirmed_vulns else "无"
-
-        # 汇总历史关键发现（最近 10 轮，每条限 100 字符，带证据级别前缀，
-        # 防止 LLM 把 suspected 发现自行升级为"已确认"写入报告）
-        all_findings: List[str] = []
-        _level_label = {"confirmed": "已确认", "suspected": "疑似", "no_finding": "无发现"}
-        for r in state.reflector.reflection_log[-10:]:
-            _lv = _level_label.get(r.get("finding_level"), "未定级")
-            for f in (r.get("key_findings") or []):
-                all_findings.append(f"[{_lv}] {str(f)[:100]}")
-            if r.get("finding_level") == "confirmed" and r.get("summary"):
-                all_findings.append(f"[已确认] {r['summary'][:100]}")
-        findings_text = "\n".join(f"  · {f}" for f in all_findings[-20:])[:1200] or "无"
-
-        # STE 经验（最近 5 条）
-        ste_text = "\n".join(
-            f"  · {s.strategy}" for s in state.reflector.persistent_insights[-5:]
-        )[:400] or "无"
-
-        # 测试文档用例统计（计划驱动主线：按方向汇总状态，列出 found 用例）
-        _plan_summary = "无"
-        if state.planner.test_plan:
-            _lines = []
-            for d in state.planner.test_plan.get("directions", []):
-                cases = d.get("cases", [])
-                _stat: Dict[str, int] = {}
-                for c in cases:
-                    _st = str(c.get("status", "pending"))
-                    _stat[_st] = _stat.get(_st, 0) + 1
-                _stat_str = " ".join(f"[{k}×{v}]" for k, v in _stat.items())
-                _lines.append(f"  · {d.get('direction', '?')}: {len(cases)} 用例 {_stat_str}")
-                for c in cases:
-                    if str(c.get("status")) == "found":
-                        _lines.append(f"      - {c.get('id')}: {str(c.get('desc', ''))[:80]}")
-            _plan_summary = ("\n".join(_lines)[:1500] or "无")
-
-        # 如果已经有确认的漏洞，调整提示词以加快报告生成
-        has_confirmed_vulns = len(state.planner.confirmed_vulns) > 0
-        urgency_hint = ""
-        if has_confirmed_vulns:
-            urgency_hint = f"""
-注意：已经发现了 {len(state.planner.confirmed_vulns)} 个确认的漏洞。现在需要快速生成总结报告，重点突出：
-1. 已确认的漏洞及其风险等级
-2. 重要的安全建议
-3. 后续的修复建议
-"""
-
-        prompt = f"""你是一名专业渗透测试工程师，请对以下测试过程生成最终总结报告（中文，供甲方阅读）。
-
-测试目标: {_real_goal(state.current_goal)}
-执行轮次: {state.execution_round} 轮（计划 {state.planner.total_rounds or "未设置"} 轮，若与实际不一致请在报告中说明动态调整情况）
-已完成方向: {state.planner.completed_directions}
-已停滞方向: {state.planner.stalled_directions}
-{urgency_hint}
-
-━━━ 测试文档用例统计（用例状态: pending未执行/done已执行/found确认漏洞/failed失败）━━━
-{_plan_summary}
-
-━━━ 已确认漏洞 ━━━
-{confirmed_detail}
-
-━━━ 历史关键发现（每条已标注证据级别）━━━
-{findings_text}
-
-━━━ 可复用经验 ━━━
-{ste_text}
-
-━━━ 证据分级铁律（违反即不合格，必须重写）━━━
-报告只能使用上方已给出的证据，严禁推断、编造 payload 或证据：
-· [已确认] 仅限"已确认漏洞"区块中列出的条目（有 payload + 可复现证据）。
-  若该区块为"无"，报告中不允许出现任何[已确认]漏洞，禁止把疑似升级为确认。
-· [疑似] 来自"历史关键发现"中标注 [疑似] 的条目，必须写明证据不足的原因与建议验证方法。
-· [无发现] 的条目不得作为漏洞写入任何章节。
-
-请按以下结构输出（纯文本，无需JSON）：
-
-## 一、漏洞总览
-（仅[已确认]漏洞，按风险等级排列。若"已确认漏洞"区块为"无"，本节必须写"未发现达到确认标准的漏洞"，不得列出具体漏洞）
-
-## 二、漏洞详情
-（仅[已确认]漏洞：类型 / 证据 / 利用方式 / payload）
-
-## 三、疑似风险
-（全部[疑似]级发现：附上已有线索、证据不足的原因、建议验证方法）
-
-## 四、未覆盖范围
-（未完成测试的 OWASP 方向及原因）
-
-## 五、修复建议
-（[已确认]漏洞给具体修复方案；[疑似]给进一步验证建议）
-
-## 六、测试结论
-（一句话总结安全态势，必须与上方分级一致）"""
-
-
-        try:
-            report = await _llm_invoke_with_retry(self.llm, prompt)
-            state.final_report = report
-            logger.info("summarizer_done", report_len=len(report))
-        except Exception as e:
-            logger.error("summarizer_failed", error=str(e))
-            state.final_report = self._build_fallback_report(state)
-
+        state.final_report = await self.orchestrator.reporter.generate_report(state)
         return state
-
-    def _build_fallback_report(self, state: DeepAgentState) -> str:
-        """LLM 调用失败时的纯文本兜底报告（从状态数据直接构建，不调用 LLM）。"""
-        lines = [
-            "# 渗透测试总结报告（自动生成）",
-            f"目标: {_real_goal(state.current_goal)}",
-            f"执行轮次: {state.execution_round}",
-        ]
-
-        # 已确认漏洞
-        if state.planner.confirmed_vulns:
-            lines.append(f"已确认漏洞数: {len(state.planner.confirmed_vulns)}")
-
-        lines += ["", "## 已确认漏洞"]
-        if state.planner.confirmed_vulns:
-            for v in state.planner.confirmed_vulns:
-                lines.append(f"- [{v.get('vuln_type')}] {v.get('proof_brief')}")
-                if v.get("payload"):
-                    lines.append(f"  payload: {v.get('payload')}")
-                if v.get("proof_detail"):
-                    lines.append(f"  证据: {v.get('proof_detail')[:200]}")
-        else:
-            lines.append("- 未发现确认漏洞")
-
-        # 从 executor 历史中提取测试过的工具和结果
-        exec_history = state.executor.execution_history if hasattr(state.executor, "execution_history") else []
-        if exec_history:
-            lines += ["", "## 执行历史摘要"]
-            tool_stats: Dict[str, int] = {}
-            success_count = 0
-            for entry in exec_history:
-                if isinstance(entry, dict):
-                    task = entry.get("task", {})
-                    tool = task.get("tool", "unknown")
-                    tool_stats[tool] = tool_stats.get(tool, 0) + 1
-                    if entry.get("success"):
-                        success_count += 1
-            lines.append(f"- 总任务数: {len(exec_history)}，成功: {success_count}，失败: {len(exec_history) - success_count}")
-            lines.append(f"- 工具分布: {dict(sorted(tool_stats.items(), key=lambda x: -x[1]))}")
-
-        # 从 executor 最近结果中提取 stdout/stderr/error 关键线索
-        if state.executor.last_result:
-            lr = state.executor.last_result
-            last_lines = []
-            if isinstance(lr, dict):
-                for key in ("stdout", "result", "data", "error"):
-                    val = lr.get(key)
-                    if val:
-                        last_lines.append(f"{key}: {str(val)[:300]}")
-            if last_lines:
-                lines += ["", "## 最新结果"]
-                lines.extend(f"- {l}" for l in last_lines)
-
-        lines += ["", "## 测试方向覆盖"]
-        lines.append(f"- 已完成: {state.planner.completed_directions or '无'}")
-        lines.append(f"- 已停滞: {state.planner.stalled_directions or '无'}")
-
-        # 关键发现（从 reflector 日志中提取，最近 5 轮，带证据级别前缀）
-        key_findings = []
-        _level_label_fb = {"confirmed": "已确认", "suspected": "疑似", "no_finding": "无发现"}
-        for r in state.reflector.reflection_log[-5:]:
-            _lv = _level_label_fb.get(r.get("finding_level"), "未定级")
-            for f in (r.get("key_findings") or []):
-                key_findings.append(f"[{_lv}] {f}")
-        if key_findings:
-            lines += ["", "## 关键发现（含证据级别）"]
-            for f in key_findings[-10:]:
-                lines.append(f"- {f}")
-
-        # STE 经验
-        if state.reflector.persistent_insights:
-            lines += ["", "## 可复用经验"]
-            for s in state.reflector.persistent_insights[-3:]:
-                lines.append(f"- {s.strategy}")
-
-        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # 路由
