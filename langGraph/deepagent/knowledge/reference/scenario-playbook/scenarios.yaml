@@ -1,0 +1,152 @@
+# 场景方法论速查表（横向视角）
+# 解决"拿到登录框只测 SQL 注入、不会弱口令爆破"的覆盖不全问题：
+# 方向是纵向（一个漏洞深挖），场景是横向（一个场景多角度）。
+# 识别到场景后，注入该场景的多角度清单 + 关联手册 payload 片段（告诉"测什么"+"怎么测"）。
+#
+# 字段约定：
+#   regex  场景识别正则（对目标 URL + 威胁模型入口点 + 任务描述做 IGNORECASE 匹配）
+#   name   场景中文名
+#   angles 该场景应测的全部角度清单（不止当前方向的单一漏洞）
+#   files  关联的 secknowledge 手册文件名（供服务端读取 payload 片段注入）
+#
+# 由 graph.py 的 _load_scenarios() 加载，进程内缓存；失败静默降级为空。
+scenarios:
+  - regex: "login|signin|登录|认证|口令|password|登录框|登录页"
+    name: 登录/认证
+    angles:
+      - "弱口令爆破：admin/root/test/guest 等常见用户名 + 常见弱密码字典批量试"
+      - "SQL 注入万能密码：' or 1=1-- / '=' / admin'--"
+      - "用户名枚举：登录成功/失败响应差异、时间差异、错误提示差异"
+      - "验证码绕过：验证码复用/爆破/前端校验删除"
+      - "认证绕过：Cookie 伪造、JWT alg=none、响应篡改、X-Forwarded-For 伪造"
+      - "会话固定/会话管理：登录前后 sessionid 是否变化"
+      - "账号锁定绕过：锁定策略是否存在、能否枚举绕过锁定"
+    files:
+      - web-logic-auth.md
+      - web-sqli.md
+  - regex: "/api/|/rest/|graphql|api接口|api 接口|rest接口|swagger|openapi"
+    name: API 接口
+    angles:
+      - "未授权访问/IDOR：遍历资源 ID、替换对象 ID 越权"
+      - "批量赋值 mass assignment：注入 role/isAdmin/price 等额外字段"
+      - "水平/垂直越权：低权限 token 调用高权限接口"
+      - "注入：SQL/NoSQL/命令注入参数、GraphQL introspection"
+      - "速率限制缺失：登录/验证码/查询接口可爆破"
+      - "信息泄露：错误信息、调试模式、版本号、隐藏字段"
+    files:
+      - web-logic-auth.md
+      - web-modern-protocols.md
+  - regex: "upload|上传|文件上传"
+    name: 文件上传
+    angles:
+      - "扩展名黑名单绕过：php/phtml/php3/php5/pht 等变体、大小写、双写"
+      - "content-type 绕过：改 MIME 类型为 image/jpeg"
+      - "文件头/magic bytes 绕过：图片马、GIF89a 前缀"
+      - "路径穿越：../../ 控制上传路径到可执行目录"
+      - "解析漏洞：.php.jpg、.htaccess、Apache 多扩展"
+    files:
+      - web-upload.md
+  - regex: "search|搜索|查询|query|find|q="
+    name: 搜索/查询
+    angles:
+      - "SQL 注入：搜索参数注入、模糊查询报错"
+      - "XSS：搜索词反射回显到页面"
+      - "SSTI：模板注入 {{7*7}} / ${7*7}"
+      - "SSRF：搜索触发服务端请求外部资源"
+    files:
+      - web-sqli.md
+      - web-xss.md
+  - regex: "支付|订单|价格|金额|优惠|积分|充值|购买|cart"
+    name: 支付/订单
+    angles:
+      - "价格篡改：负数、0 元、小数精度、整数溢出"
+      - "条件竞争：并发兑换/下单/领取"
+      - "参数篡改：数量、金额、优惠券叠加、运费"
+      - "订单越权：遍历订单 ID 查看/修改他人订单"
+    files:
+      - web-logic-auth.md
+  - regex: "reset|forgot|忘记密码|重置密码|找回密码|password reset"
+    name: 密码重置/找回
+    angles:
+      - "验证码泄露：响应包含验证码"
+      - "验证码与用户解绑：用自己的码重置他人账号"
+      - "步骤跳过：直接跳到重置成功步骤/篡改响应"
+      - "参数篡改：username/uid 改为目标用户"
+    files:
+      - web-logic-auth.md
+  - regex: "register|signup|注册|注册页|create account"
+    name: 注册流程
+    angles:
+      - "任意用户注册：无邀请码/校验直接注册"
+      - "批量注册/撞库：枚举已有账号、批量注册"
+      - "弱口令：注册时密码强度策略缺失"
+      - "越权：注册即获得高权限/默认管理员角色"
+      - "SQL 注入：注册表单参数注入"
+      - "验证码绕过：注册验证码复用/爆破"
+    files:
+      - web-logic-auth.md
+      - web-sqli.md
+  - regex: "comment|评论|留言|review|feedback"
+    name: 评论/留言
+    angles:
+      - "存储型 XSS：评论内容未过滤"
+      - "SQL 注入：评论参数注入"
+      - "CSRF：发表/删除评论无 token"
+      - "越权：删除/修改他人评论"
+    files:
+      - web-xss.md
+      - web-sqli.md
+  - regex: "profile|个人中心|用户资料|userinfo|account|个人信息"
+    name: 个人中心/用户信息
+    angles:
+      - "IDOR：修改/查看他人资料"
+      - "信息泄露：手机号/邮箱/地址等敏感字段泄露"
+      - "越权修改：普通用户篡改管理员字段(role/isAdmin)"
+      - "XSS：昵称/签名反射或存储到页面"
+    files:
+      - web-logic-auth.md
+      - web-leak.md
+  - regex: "download|下载|file_get|loadfile|attachment|读取文件"
+    name: 文件下载/读取
+    angles:
+      - "路径穿越：../../etc/passwd、绝对路径"
+      - "任意文件读：file= 参数可控"
+      - "IDOR：下载他人文件/附件"
+    files:
+      - web-traversal.md
+  - regex: "sms|短信|验证码|captcha|otp|verify code"
+    name: 短信/验证码
+    angles:
+      - "验证码爆破：4-6 位验证码无频率限制"
+      - "短信轰炸：同一手机号重复发送"
+      - "验证码绕过：复用/前端校验/响应泄露"
+      - "验证码与用户解绑：自己的码操作他人账号"
+    files:
+      - web-logic-auth.md
+  - regex: "admin|后台|manage|dashboard|管理"
+    name: 后台管理
+    angles:
+      - "未授权访问：后台路径可直接访问"
+      - "弱口令：后台管理员弱密码"
+      - "隐藏后台：枚举后台路径/子目录"
+      - "越权：普通用户访问后台接口"
+    files:
+      - web-logic-auth.md
+      - web-leak.md
+  - regex: "url=|redirect|跳转|重定向|callback|回调|proxy|webhook"
+    name: SSRF/URL 跳转
+    angles:
+      - "SSRF：url 参数指向内网/元数据"
+      - "开放重定向：redirect 参数未校验"
+      - "云元数据：169.254.169.254 探测"
+      - "外联回调：dnslog/ceye 验证"
+    files:
+      - web-ssrf-misc.md
+  - regex: "include|php://|文件包含|lfi|rfi|page="
+    name: 文件包含
+    angles:
+      - "LFI：../../etc/passwd、php://filter"
+      - "RFI：远程文件包含执行代码"
+      - "日志投毒：包含日志文件转 RCE"
+    files:
+      - web-traversal.md

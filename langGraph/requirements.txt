@@ -35,3 +35,6 @@ pyyaml>=6.0.0
 
 # Browser automation (optional)
 playwright>=1.48.0
+
+# Testing (dev)
+pytest>=8.0.0

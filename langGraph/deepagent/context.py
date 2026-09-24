@@ -79,10 +79,10 @@ class PlannerContext(BaseModel):
     # 每项: {"id": 递增编号, "kind": 证据类型, "content": 原文摘录, "round": 轮次}
     evidence_vault: List[Dict[str, Any]] = Field(default_factory=list)
 
-    # ── 确定性扫描种子（nuclei 预扫，任务开始前服务端自动执行）──────
-    # 每项: {"kind": tech|cve-match|exposure|info,
-    #        "desc": "模板名+severity 一句话", "evidence": "命中 URL",
-    #        "covered": false(未验证)/true(已并入测试)}
+    # ── 侦察种子（主动扫描 + 被动 OSINT，任务开始前服务端自动执行）────
+    # kind: tech|cve-match|exposure|info（nuclei）、port（nmap）、directory（ffuf）、
+    #       subdomain|historical-url|dns-record（被动 OSINT）
+    # 每项: {"kind", "desc": 一句话, "evidence": 原文, "covered": false(未验证)/true(已并入测试)}
     # Planner 每轮可见：优先利用种子规划任务，禁止重复扫描已覆盖项
     scan_seeds: List[Dict[str, Any]] = Field(default_factory=list)
 

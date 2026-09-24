@@ -32,6 +32,7 @@ except ImportError:
 import signal
 import functools
 import os
+import contextvars
 
 logger = structlog.get_logger(__name__)
 
@@ -205,6 +206,85 @@ class _OutputBuffer:
             self._truncated = False
 
 
+class _HttpFingerprintCollector:
+    """收集沙箱内 HTTP 响应指纹（url/status/length/内容片段）。
+
+    目的：让 Reflector 能对同轮多个任务的 HTTP 响应做结构化差异对比，
+    而非只看"都返回 200"的平坦表象（修复响应证据链断裂）。
+    """
+
+    def __init__(self, max_entries: int = 40, snippet_len: int = 200):
+        self._entries: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self.max_entries = max_entries
+        self.snippet_len = snippet_len
+
+    def record(self, url: str, status: Any, length: Any, snippet: str) -> None:
+        with self._lock:
+            if len(self._entries) >= self.max_entries:
+                return
+            self._entries.append({
+                "url": str(url)[:200],
+                "status": status,
+                "length": length,
+                "snippet": (snippet or "")[:self.snippet_len],
+            })
+
+    def to_list(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._entries)
+
+
+# 需要捕获指纹的 HTTP 模块级方法
+_HTTP_METHODS = ("get", "post", "put", "delete", "patch", "head", "options", "request")
+
+
+class _FingerprintingHttpProxy:
+    """透明代理 httpx/requests 模块：拦截模块级 get/post 等函数捕获响应指纹。
+
+    对 `import httpx; httpx.get(...)` / `from httpx import get` 均生效；
+    未拦截的属性（如 httpx.Client）经 __getattr__ 透明转发到真实模块，
+    不影响 LLM 代码正常使用（仅额外记录指纹，失败静默）。
+    """
+
+    def __init__(self, real_module: Any, collector_getter: Callable[[], Any]):
+        self._real = real_module
+        self._get_collector = collector_getter
+        for _m in _HTTP_METHODS:
+            if hasattr(real_module, _m):
+                setattr(self, _m, self._make_wrapper(_m, getattr(real_module, _m)))
+
+    def _make_wrapper(self, method: str, original: Callable) -> Callable:
+        def wrapper(*args, **kwargs):
+            resp = original(*args, **kwargs)
+            self._capture(resp, args[0] if args else kwargs.get("url", ""))
+            return resp
+        return wrapper
+
+    def _capture(self, resp: Any, url: Any) -> None:
+        try:
+            col = self._get_collector()
+            if col is None:
+                return
+            status = getattr(resp, "status_code", None)
+            if status is None:
+                return
+            try:
+                length = len(resp.content)
+            except Exception:
+                length = None
+            try:
+                text = resp.text
+            except Exception:
+                text = ""
+            col.record(url, status, length, text)
+        except Exception:
+            pass
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
 class _SandboxImporter:
     """沙箱导入器 - 控制模块导入权限"""
 
@@ -213,6 +293,18 @@ class _SandboxImporter:
         self._imported = {}
         self._lock = threading.Lock()
         self._audit = audit_callback
+        # 当前 execute 的 HTTP 指纹收集器（contextvar 跨 run_in_executor 线程传播）
+        self._collector_var = contextvars.ContextVar("http_fingerprint_collector", default=None)
+
+    def set_collector(self, collector: Any):
+        """设置当前执行的指纹收集器，返回 token 供 reset_collector 恢复。"""
+        return self._collector_var.set(collector)
+
+    def get_collector(self):
+        return self._collector_var.get()
+
+    def reset_collector(self, token) -> None:
+        self._collector_var.reset(token)
 
     def import_module(self, name: str, *args, **kwargs):
         """安全导入模块"""
@@ -247,6 +339,9 @@ class _SandboxImporter:
 
         try:
             module = __import__(name, *args, **kwargs)
+            # 响应指纹：对 httpx/requests 返回透明代理，捕获 HTTP 响应指纹
+            if name in ("httpx", "requests"):
+                module = _FingerprintingHttpProxy(module, self.get_collector)
             with self._lock:
                 self._imported[name] = module
             return module
@@ -708,6 +803,10 @@ class PythonExecutor:
         buf_out = _OutputBuffer(self.max_output)
         buf_err = _OutputBuffer(self.max_output)
 
+        # 响应指纹：收集沙箱内 HTTP 响应（url/status/length/片段）供 Reflector 做差异对比
+        _collector = _HttpFingerprintCollector()
+        _collector_token = self._importer.set_collector(_collector)
+
         try:
             # 获取或创建会话
             if session_id:
@@ -764,6 +863,7 @@ class PythonExecutor:
                 "stdout": buf_out.getvalue(),
                 "stderr": buf_err.getvalue(),
                 "execution_time": elapsed,
+                "http_fingerprints": _collector.to_list(),
             }
 
             if error_tb:
@@ -789,6 +889,7 @@ class PythonExecutor:
                 "stdout": buf_out.getvalue(),
                 "stderr": buf_err.getvalue(),
                 "execution_time": elapsed,
+                "http_fingerprints": _collector.to_list(),
             }
 
         except SecurityError as e:
@@ -805,6 +906,7 @@ class PythonExecutor:
                 "stdout": buf_out.getvalue(),
                 "stderr": buf_err.getvalue(),
                 "execution_time": elapsed,
+                "http_fingerprints": _collector.to_list(),
             }
 
         except Exception as e:
@@ -819,7 +921,11 @@ class PythonExecutor:
                 "stdout": buf_out.getvalue(),
                 "stderr": buf_err.getvalue(),
                 "execution_time": elapsed,
+                "http_fingerprints": _collector.to_list(),
             }
+
+        finally:
+            self._importer.reset_collector(_collector_token)
 
     @staticmethod
     def _run_code(code: str, exec_globals: dict) -> Optional[str]:

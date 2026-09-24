@@ -21,3 +21,14 @@ langGraph/deepagent/knowledge/reference/hacktricks/
 langGraph/deepagent/knowledge/reference/wstg/
 langGraph/deepagent/knowledge/reference/nuclei-templates/
 langGraph/deepagent/knowledge/reference/Dictionary/
+
+# 确定性扫描工具的 Go/Python 二进制（数十~百MB 且 nuclei.exe 超 GitHub 100MB
+# 单文件上限；clone 后按 langGraph/tools/ 内 README 从各官方 release 下载）
+langGraph/tools/*.exe
+
+# 运行时产物（日志/会话记忆/临时验证脚本）
+*.log
+langGraph/.logs/
+langGraph/deepagent/.logs/
+langGraph/deepagent/.chat_state/
+langGraph/_run_target_test.py

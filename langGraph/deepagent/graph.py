@@ -1,6 +1,7 @@
 """LangGraph 状态图 - Planner-Executor-Reflector 循环"""
 
 import asyncio
+import functools
 import json
 import os
 import re
@@ -43,14 +44,31 @@ _TOOLS_DIR = os.path.join(
 )
 _NUCLEI_BIN = os.path.join(_TOOLS_DIR, "nuclei.exe")
 _FFUF_BIN = os.path.join(_TOOLS_DIR, "ffuf.exe")
+# 扩预扫新增的 Go 侦察工具（与 nuclei/ffuf 同目录，即插即用；缺失静默降级）
+_SUBFINDER_BIN = os.path.join(_TOOLS_DIR, "subfinder.exe")  # 被动子域枚举（聚合 40+ 免费源）
+_DNSX_BIN = os.path.join(_TOOLS_DIR, "dnsx.exe")            # DNS 批量解析（存活子域/IP）
+_HTTPX_BIN = os.path.join(_TOOLS_DIR, "httpx.exe")          # 存活+指纹（status/title/server/tech）
+_KATANA_BIN = os.path.join(_TOOLS_DIR, "katana.exe")        # 主动爬虫（JS/表单/API 端点）
+_NAABU_BIN = os.path.join(_TOOLS_DIR, "naabu.exe")          # 广扫端口（喂 nmap -sV 精测）
+_GAU_BIN = os.path.join(_TOOLS_DIR, "gau.exe")              # 历史 URL 聚合（Common Crawl/OTX 等）
 _NUCLEI_TEMPLATES = os.path.join(
     os.path.dirname(_SECKNOWLEDGE_DIR), "nuclei-templates",
 )
+
+# ── 用户常用字典库（信息收集/弱口令爆破的本地字典源）───────────────────
+# 默认 E:\notebook\字典（用户常用路径），WORDLIST_DIR 环境变量可覆盖；
+# 目录不存在时各处静默回退内置小字典，不影响主流程。
+_WORDLIST_DIR = os.environ.get("WORDLIST_DIR") or r"E:\notebook\字典"
 
 # CWE 模式库目录（§5.3 模式条目：触发特征/需证明/误报原因/检查步骤，
 # Finder/Planner 逐类质问清单的数据源；与 secknowledge 手册互补）
 _CWE_PATTERNS_DIR = os.path.join(
     os.path.dirname(_SECKNOWLEDGE_DIR), "cwe-patterns",
+)
+
+# 场景方法论速查目录（横向视角：场景 → 多角度清单 + 关联手册）
+_SCENARIO_DIR = os.path.join(
+    os.path.dirname(_SECKNOWLEDGE_DIR), "scenario-playbook",
 )
 
 _cwe_patterns_cache: Optional[List[Dict[str, Any]]] = None
@@ -78,9 +96,41 @@ def _load_cwe_patterns() -> List[Dict[str, Any]]:
     return patterns
 
 
+_scenario_cache: Optional[List[tuple]] = None
+
+
+def _load_scenarios() -> List[tuple]:
+    """加载场景方法论速查表（scenario-playbook/scenarios.yaml），进程内缓存。
+
+    返回 [(regex, name, angles, files)]；失败静默返回空列表（降级为无场景提示）。
+    """
+    global _scenario_cache
+    if _scenario_cache is not None:
+        return _scenario_cache
+    import yaml
+    scenarios: List[tuple] = []
+    try:
+        path = os.path.join(_SCENARIO_DIR, "scenarios.yaml")
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        for s in (data.get("scenarios") or []):
+            if isinstance(s, dict) and s.get("regex") and s.get("name"):
+                scenarios.append((
+                    str(s["regex"]),
+                    str(s["name"]),
+                    [str(a) for a in (s.get("angles") or [])],
+                    [str(f) for f in (s.get("files") or [])],
+                ))
+    except Exception as e:
+        logger.warning("scenario_playbook_load_failed", error=str(e))
+    _scenario_cache = scenarios
+    return scenarios
+
+
 def _patterns_for_focus(vuln_focus: str, limit: int = 2) -> List[Dict[str, Any]]:
-    """按 OWASP 方向（前缀 A01-A10）路由匹配的 CWE 模式条目。"""
-    key = (vuln_focus or "").strip()[:3]
+    """按方向 code 路由匹配的 CWE 模式条目（web 域条目以 owasp 字段标 A01-A10；
+    ai-llm 域当前无 CWE 模式条目 → 返回空，由 skill 手册承担质问职责）。"""
+    key = _dir_code(vuln_focus or "")
     if not key:
         return []
     matched = [
@@ -147,6 +197,46 @@ def _ffuf_available() -> bool:
     return os.path.exists(_FFUF_BIN)
 
 
+def _wordlist_dir() -> Optional[str]:
+    """返回存在的字典库目录（WORDLIST_DIR 环境变量优先）；不存在返回 None。"""
+    _d = os.environ.get("WORDLIST_DIR") or _WORDLIST_DIR
+    if _d and os.path.isdir(_d):
+        return _d
+    return None
+
+
+# 目录爆破预扫专用的小字典（少量条目且高命中：配置文件/敏感路径）
+_WORDLIST_SMALL_FILES = ("springboot.txt", "Java_file.txt", "文件读取.txt")
+
+
+@functools.lru_cache(maxsize=1)
+def _wordlist_catalog() -> List[str]:
+    """枚举字典库内 txt 文件，返回 'name.txt(N行)' 描述列表；目录缺失返回 []。
+
+    lru_cache 进程内只枚举一次；供 Planner 提示词展示可用字典（LLM 按名 -w 引用）。
+    """
+    _d = _wordlist_dir()
+    if not _d:
+        return []
+    cats: List[str] = []
+    try:
+        for name in sorted(os.listdir(_d)):
+            if not name.lower().endswith(".txt"):
+                continue
+            p = os.path.join(_d, name)
+            try:
+                with open(p, encoding="utf-8", errors="ignore") as f:
+                    n = sum(1 for _ in f)
+            except Exception:
+                continue
+            if n <= 0:
+                continue
+            cats.append(f"{name}({n}行)")
+    except Exception:
+        return []
+    return cats
+
+
 def _nmap_path() -> Optional[str]:
     """解析 nmap.exe 路径：NMAP_BIN 环境变量 > 系统 PATH > 候选目录。找不到返回 None。"""
     import shutil
@@ -168,6 +258,7 @@ def _nmap_available() -> bool:
 # OWASP 方向 → secknowledge 参考文件（确定性注入映射：Planner 不再依赖
 # "自觉 cat"，服务端按当前方向直接把对应手册的 payload/绕过片段喂进提示词）
 _SKILL_BY_DIR = {
+    # web 域（OWASP Top10）
     "A01": "web-logic-auth.md",
     "A02": "web-modern-protocols.md",
     "A03": "web-sqli.md",
@@ -178,6 +269,14 @@ _SKILL_BY_DIR = {
     "A08": "web-deser.md",
     "A09": "web-modern-protocols.md",
     "A10": "web-ssrf-misc.md",
+    # ai-llm 域（L0x，对应 secknowledge-skill 的 ai-*.md 手册）
+    "L01": "ai-app-prompt-1.md",
+    "L02": "ai-model-jailbreak.md",
+    "L03": "ai-app-mcp.md",
+    "L04": "ai-app-agent-cot-1.md",
+    "L05": "ai-data-app-1.md",
+    "L06": "ai-baseline-escape.md",
+    "L07": "ai-model-extraction.md",
 }
 
 # 任务描述关键词 → 补充文件（跨方向场景，如方向为 A05 但任务实际是反序列化）
@@ -190,7 +289,97 @@ _SKILL_KEYWORD_FILES = [
     ("rce|命令执行|system[(]|eval[(]|webshell", "web-rce.md"),
     ("ssrf|内网探测|169.254", "web-ssrf-misc.md"),
     ("log|日志", "web-modern-protocols.md"),
+    # ai-llm 域关键词（Prompt 注入/越狱/MCP/Agent/RAG/沙箱逃逸等）
+    ("prompt|提示词|提示注入|间接注入", "ai-app-prompt-1.md"),
+    ("越狱|jailbreak|角色逃逸", "ai-model-jailbreak.md"),
+    ("mcp|工具调用|模型上下文协议", "ai-app-mcp.md"),
+    ("agent|智能体|多agent|多智能体|工具滥用", "ai-app-agent-cot-1.md"),
+    ("rag|检索增强|知识库投毒|数据投毒", "ai-data-app-1.md"),
+    ("沙箱逃逸|容器逃逸|隔离失效", "ai-baseline-escape.md"),
+    ("模型窃取|模型提取|extraction", "ai-model-extraction.md"),
 ]
+
+# ── CTF Web 进阶手册（knowledge/reference/ctf-web/，平铺无 references 子目录）──
+# 与 secknowledge 的 web 手册互补：secknowledge = 方法论 + 基础 payload；
+# ctf-web = 进阶 exploit/高级绕过/CTF 特例（innodb_table_stats WAF 绕过、
+# 原型污染、Rogue MySQL 文件读、SSTI 链等）。文件名带 "ctf-web/" 前缀标记目录，
+# 供 _read_skill_snippet 解析实际路径（平铺目录 vs secknowledge 的 references/）。
+_CTF_WEB_DIR = os.path.join(os.path.dirname(_SECKNOWLEDGE_DIR), "ctf-web")
+
+# 任务描述关键词 → ctf-web 文件（web 域进阶场景；与 secknowledge 关键词互补，
+# 由 _fetch_ctf_payloads 独立注入，不占用 skill_hint 的 2 文件名额）
+_CTF_WEB_KEYWORD_FILES = [
+    ("sqli|sql 注入|information_schema|union select|盲注", "ctf-web/sql-injection.md"),
+    ("ssti|模板注入|jinja|twig|smarty", "ctf-web/server-side.md"),
+    ("xss|csp|csrf|跨站脚本", "ctf-web/client-side.md"),
+    ("ssrf|内网探测|169.254|gopher|dns rebinding", "ctf-web/server-side-advanced.md"),
+    ("xxe|外部实体|DOCTYPE", "ctf-web/server-side-2.md"),
+    ("命令注入|rce|代码执行|webshell|反弹", "ctf-web/server-side-exec.md"),
+    ("反序列|deserial|pickle|phar|unserialize|ysoserial", "ctf-web/server-side-deser.md"),
+    ("jwt|jwe|json web token", "ctf-web/auth-jwt.md"),
+    ("越权|idor|认证绕过|auth bypass|access control", "ctf-web/auth-and-access.md"),
+    ("oauth|saml|cors|openid|sso", "ctf-web/auth-infra.md"),
+    ("原型污染|prototype pollution|__proto__", "ctf-web/node-and-prototype.md"),
+    ("上传|upload|文件上传", "ctf-web/server-side-exec-2.md"),
+    ("路径穿越|traversal|lfi|文件包含|php://filter", "ctf-web/server-side.md"),
+    ("请求走私|request smuggling|http smuggling", "ctf-web/client-side.md"),
+]
+
+
+def _skill_referenced_files() -> Set[str]:
+    """从确定性注入映射派生全部被引用的手册文件（web + ai-llm + ctf-web，单一事实源）。
+
+    _SKILL_BY_DIR + _SKILL_KEYWORD_FILES（secknowledge，无前缀）+ _CTF_WEB_KEYWORD_FILES
+    （ctf-web，带 "ctf-web/" 前缀）是内部 agent 确定性注入的权威路由，此函数抽取其
+    引用的全部文件名，供 SKILL.md 导航索引一致性校验使用。
+    """
+    files: Set[str] = set(_SKILL_BY_DIR.values())
+    for _pat, f in _SKILL_KEYWORD_FILES:
+        files.add(f)
+    for _pat, f in _CTF_WEB_KEYWORD_FILES:
+        files.add(f)
+    return files
+
+
+@functools.lru_cache(maxsize=1)
+def _validate_skill_index_consistency() -> None:
+    """校验 SKILL.md 与代码确定性注入映射的文件集合一致性。
+
+    消除"双路由漂移"：单一事实源 = _SKILL_BY_DIR + _SKILL_KEYWORD_FILES +
+    _CTF_WEB_KEYWORD_FILES（代码侧，服务端确定性注入实际使用的路由）。分两组校验：
+    secknowledge 文件（无前缀）→ 对照 secknowledge/SKILL.md；ctf-web 文件（带
+    "ctf-web/" 前缀，去掉前缀后）→ 对照 ctf-web/SKILL.md。只比对"代码引用的每个
+    文件名是否在对应 SKILL.md 中出现"（裸文件名子串，兼容带/不带 references/ 前缀）。
+    只告警不阻断；SKILL.md 缺失/解析失败静默跳过。lru_cache 保证进程内只校验一次。
+    """
+    code_files = _skill_referenced_files()
+    _CTF_PREFIX = "ctf-web/"
+    groups: Dict[str, List[str]] = {"secknowledge": [], "ctf-web": []}
+    for f in code_files:
+        if f.startswith(_CTF_PREFIX):
+            groups["ctf-web"].append(f[len(_CTF_PREFIX):])
+        else:
+            groups["secknowledge"].append(f)
+    _INDEX_FILES = {
+        "secknowledge": os.path.join(_SECKNOWLEDGE_DIR, "SKILL.md"),
+        "ctf-web": os.path.join(_CTF_WEB_DIR, "SKILL.md"),
+    }
+    for group, files in groups.items():
+        index = _INDEX_FILES[group]
+        try:
+            with open(index, encoding="utf-8", errors="ignore") as f:
+                text = f.read()
+        except Exception as e:
+            logger.debug("skill_index_read_failed", group=group, error=str(e))
+            continue
+        missing = sorted(f for f in files if f not in text)
+        if missing:
+            logger.warning(
+                "skill_index_drift_code_only",
+                group=group,
+                files=missing,
+                hint="代码确定性注入引用这些手册，但对应 SKILL.md 导航索引未出现，需补登记或修正映射",
+            )
 
 # ── 对抗式验证 / Finding 机器校验 / 复现协议已迁入独立裁决角色
 #    VerifierAgent（agents.py，形态 D 多 Agent）：证伪者提示词、多路多数
@@ -376,28 +565,143 @@ def _history_of_goal(goal: str, max_len: int = 2000) -> str:
     return ""
 
 
-# OWASP Top10 规范方向名（短横格式为内部 canonical）。存入 state 前一律经
-# _norm_dir 归一，避免 LLM 输出 "A03 SQL注入"/"A03-SQL注入"/"A03" 等不同写法
-# 导致 completed/stalled 判定与 goal_achieved 失效。pivot 的 all_top10 与
-# _analyze_target_directions 的 _all 均引用此常量，保证归一映射与比较列表同源。
-_OWASP_DIRECTIONS = [
-    "A01-访问控制", "A02-加密失败", "A03-SQL注入", "A04-不安全设计",
-    "A05-安全配置错误", "A06-已知漏洞组件", "A07-身份认证失败",
-    "A08-完整性失败", "A09-日志缺失", "A10-SSRF",
+# ── 方向目录（单一事实源）：域 × 子方向 ───────────────────────────────
+# 旧架构把方向锁死为 OWASP Web Top10（_OWASP_DIRECTIONS 硬编码 A01-A10），
+# 导致 secknowledge-skill 里的 AI 手册（ai-*.md）虽有知识却永远不被测试。
+# 现拆为两层：域（攻击面类型，由 _analyze_target_directions 依据目标特征判定）
+#   → 子方向（域内具体测试方向）。方向全名 = f"{code}-{name}"（如 "A03-SQL注入"
+#   / "L01-Prompt 注入"），code 全局唯一（web 用 A0x，ai-llm 用 L0x）。
+# 存入 state 前一律经 _norm_dir 归一；pivot / goal_achieved / skill 映射均经
+# _dir_code 提取 code 后比较（废除旧 [:3] 前缀假设，code 长度不依赖固定位数）。
+_DIRECTION_CATALOG = {
+    "web": {
+        "label": "Web 应用",
+        "directions": {
+            "A01": "访问控制", "A02": "加密失败", "A03": "SQL注入",
+            "A04": "不安全设计", "A05": "安全配置错误", "A06": "已知漏洞组件",
+            "A07": "身份认证失败", "A08": "完整性失败", "A09": "日志缺失",
+            "A10": "SSRF",
+        },
+    },
+    "ai-llm": {
+        "label": "AI/LLM 应用",
+        "directions": {
+            "L01": "Prompt 注入", "L02": "越狱", "L03": "MCP 攻击",
+            "L04": "Agent 滥用", "L05": "RAG 投毒", "L06": "沙箱逃逸",
+            "L07": "模型窃取",
+        },
+    },
+}
+
+# 全部方向全名（顺序 = 目录顺序：先 web 后 ai-llm）
+_ALL_DIRECTION_NAMES: List[str] = [
+    f"{code}-{name}"
+    for _cfg in _DIRECTION_CATALOG.values()
+    for code, name in _cfg["directions"].items()
 ]
-_DIR_BY_PREFIX = {d[:3]: d for d in _OWASP_DIRECTIONS}  # "A03" → "A03-SQL注入"
+
+# code → 方向全名（"A03" → "A03-SQL注入"、"L01" → "L01-Prompt 注入"）
+_DIR_BY_CODE: Dict[str, str] = {
+    name.split("-", 1)[0]: name for name in _ALL_DIRECTION_NAMES
+}
+
+# code → 域（"A03" → "web"、"L01" → "ai-llm"）
+_CODE_TO_DOMAIN: Dict[str, str] = {
+    code: domain
+    for domain, cfg in _DIRECTION_CATALOG.items()
+    for code in cfg["directions"]
+}
+
+
+def _dir_code(name: str) -> str:
+    """从任意方向名提取 code（"A03-SQL注入"/"A03 SQL注入"/"a03"/"A03" → "A03"）。
+
+    优先匹配已知 code（精确/带 - /带空白 /带全角冒号前缀）；未命中则取首个
+    分隔符前 token 大写，仍无则回退前 3 字符。废除旧 [:3] 硬编码前缀假设。
+    """
+    if not name:
+        return ""
+    s = name.strip()
+    for code in _DIR_BY_CODE:
+        if (s == code or s.startswith(code + "-") or s.startswith(code + " ")
+                or s.startswith(code + "：")):
+            return code
+    head = re.split(r"[-  ：]", s, 1)[0].upper()
+    if head in _DIR_BY_CODE:
+        return head
+    return head[:3]
 
 
 def _norm_dir(name: str) -> str:
-    """将任意方向名归一化为 canonical 短横格式。
+    """将任意方向名归一化为 canonical 短横格式（code-name）。
 
-    A03 SQL注入 / A03-SQL注入 / a03 / A03 → A03-SQL注入；
-    无法识别 A0x 前缀时原样返回（保留自定义方向名，不误吞）。
+    "A03 SQL注入"/"A03-SQL注入"/"a03"/"A03" → "A03-SQL注入"；
+    "L01 Prompt 注入"/"L01" → "L01-Prompt 注入"；
+    无法识别已知 code 时原样返回（保留自定义方向名，不误吞）。
     """
     if not name:
         return name
-    key = name.strip()[:3].upper()
-    return _DIR_BY_PREFIX.get(key, name.strip())
+    return _DIR_BY_CODE.get(_dir_code(name), name.strip())
+
+
+def _domain_hint(vuln_focus: str) -> str:
+    """按当前方向的域，注入域专精方法论提示（P1：域专精探查）。
+
+    web 域 → OWASP/黑盒 Web 思路；ai-llm 域 → GAARM/越狱/Prompt 注入/MCP 思路。
+    帮助 Planner 切域时切换心智模型，而非把 Web 那套硬套到 AI 攻击面。
+    """
+    domain = _CODE_TO_DOMAIN.get(_dir_code(vuln_focus or ""), "")
+    if domain == "ai-llm":
+        return (
+            "\n━━━ 域专精提示（当前方向属 AI/LLM 域，勿套用 Web 黑盒思路）━━━\n"
+            "  · 攻击面不是 URL 参数，而是：系统提示词、工具描述/参数、外部数据源(RAG)、"
+            "多 Agent 协作协议(MCP)、模型输出通道、沙箱边界\n"
+            "  · 判定证据 = 模型行为差异（越权回答/泄露系统提示/执行注入指令/工具滥用），"
+            "而非 HTTP 报错/回显\n"
+            "  · 复现 = 同一注入在多次对话/多轮上下文稳定触发，警惕单次偶然\n"
+        )
+    return (
+        "\n━━━ 域专精提示（当前方向属 Web 域）━━━\n"
+        "  · 攻击面 = URL 参数/表单/接口/上传点/头字段，证据 = 报错回显/延时/外联/数据差异\n"
+        "  · 优先确定性验证：布尔/时间盲注、UNION 回显、外带回调，落证据原文\n"
+    )
+
+
+# ── 场景方法论速查表已外置到 knowledge/reference/scenario-playbook/scenarios.yaml，
+#    由 _load_scenarios() 加载（进程内缓存）；识别/注入逻辑见 _scenario_hits / _scenario_hint ──
+
+
+def _scenario_hits(goal: str, entry_points: list, task_desc: str) -> list:
+    """识别命中的场景，返回 [(场景名, 角度清单, 关联手册列表)]，最多 2 个。"""
+    parts = [str(goal or ""), str(task_desc or "")]
+    for e in (entry_points or []):
+        if isinstance(e, dict):
+            parts.append(str(e.get("url", "")))
+            parts.append(" ".join(str(p) for p in (e.get("params") or [])))
+    text = " ".join(parts)
+    hits = []
+    for pattern, name, angles, files in _load_scenarios():
+        if re.search(pattern, text, re.IGNORECASE):
+            hits.append((name, angles, files))
+    return hits[:2]
+
+
+def _scenario_hint(goal: str, entry_points: list, task_desc: str) -> str:
+    """注入命中场景的多角度清单（不含 payload 片段，payload 由 _planner_node 读取）。"""
+    hits = _scenario_hits(goal, entry_points, task_desc)
+    if not hits:
+        return ""
+    blocks = []
+    for name, angles, _files in hits:
+        blocks.append(
+            f"◆ 场景【{name}】应测角度（不止当前方向的单一漏洞）:\n"
+            + "\n".join(f"  · {a}" for a in angles)
+        )
+    return (
+        "\n━━━ 场景方法论速查（识别到目标含以下场景，本轮任务必须铺开多角度，"
+        "禁止只测当前方向的单一漏洞）━━━\n"
+        + "\n".join(blocks) + "\n"
+    )
 
 
 def _get_sub(state, sub_name: str):
@@ -468,6 +772,9 @@ class DeepAgentGraph:
         #    由 reflector/summarizer 节点调用；meta_executor 供复现协议复用 ──
         self.orchestrator = AgentOrchestrator(llm=llm, meta_executor=self.meta_executor)
 
+        # 双路由一致性校验：代码映射 vs SKILL.md 导航索引（lru_cache 保证进程内只跑一次）
+        _validate_skill_index_consistency()
+
         # 会话内已执行任务指纹（工具+参数精确匹配）：执行前硬去重，
         # 同质任务连代码生成/执行都跳过，节省轮次与 LLM token
         self._exec_fingerprints: deque = deque(maxlen=40)
@@ -478,6 +785,8 @@ class DeepAgentGraph:
         # 证据原文库去重：已入 vault 的证据指纹（前 60 字符），实例级跨轮去重
         self._evidence_seen: Set[str] = set()
         self._evidence_id: int = 0
+        # 源码情报去重（_extract_source_intel）：类名集合指纹，防同份源码跨轮重复入资产面板
+        self._source_intel_seen: Set[str] = set()
         # 用户实时纠偏/补充指令（steer）：运行中由 chat_server 追加，Planner 每轮消费
         # （不打断任务，只影响后续轮次的方向与任务生成）
         self.steering: List[str] = []
@@ -550,6 +859,41 @@ class DeepAgentGraph:
             _last_desc,
         )
 
+        # ── CTF Web 进阶手册（按任务关键词注入，突破基础 payload 被过滤）──
+        ctf_hint = self._fetch_ctf_payloads(
+            state.planner.current_vuln_focus or "",
+            _last_desc,
+        )
+
+        # ── 域专精提示（P1）：按当前方向所属域注入方法论，切域时换心智模型 ──
+        domain_hint = _domain_hint(state.planner.current_vuln_focus or "")
+
+        # ── 场景方法论速查（横向视角）：识别登录框/API/上传等场景，注入多角度清单 ──
+        _tm_eps = []
+        if isinstance(state.planner.threat_model, dict):
+            _tm_eps = state.planner.threat_model.get("entry_points", []) or []
+        _scn_hits = _scenario_hits(state.current_goal or "", _tm_eps, _last_desc)
+        scenario_hint = _scenario_hint(state.current_goal or "", _tm_eps, _last_desc)
+
+        # 场景关联手册的 payload 片段：告诉"怎么测"（去重后限 2 个手册，控制长度）
+        scenario_payload_hint = ""
+        if _scn_hits:
+            _pfiles: List[str] = []
+            for _name, _angles, _files in _scn_hits:
+                for _f in _files:
+                    if _f not in _pfiles:
+                        _pfiles.append(_f)
+            _pparts = []
+            for _f in _pfiles[:2]:
+                _snip = self._read_skill_snippet(_f)
+                if _snip:
+                    _pparts.append(f"—— 《{_f}》 ——\n{_snip}")
+            if _pparts:
+                scenario_payload_hint = (
+                    "\n━━━ 场景关联手册 payload（上述场景的具体测试方法，已注入，直接使用）━━━\n"
+                    + "\n\n".join(_pparts) + "\n"
+                )[:1600]
+
         # ── CWE 模式质问清单（§5.3 用法1）：按当前方向路由模式条目注入。
         #    tasks 必须逐条对照 check_steps 生成；证明不齐的只能标假设 ──
         pattern_hint = ""
@@ -583,11 +927,13 @@ class DeepAgentGraph:
         asset_hint = ""
         _ws_lines: List[str] = []
         if state.planner.assets:
-            _ws_lines.append("【攻击资产面板——已到手的牌，本轮必须利用】")
+            _ws_lines.append("【攻击资产面板——已到手的牌，本轮必须利用（含来源域，跨域产物可作他域输入）】")
             for a in state.planner.assets[-12:]:
                 _ev = str(a.get("evidence", ""))[:140].replace("\n", " ")
+                _dom = a.get("domain", "")
+                _dom_label = {"web": "Web", "ai-llm": "AI"}.get(_dom, _dom or "?")
                 _ws_lines.append(
-                    f"· [{a.get('kind')}] {str(a.get('desc'))[:110]}"
+                    f"· [{_dom_label}] [{a.get('kind')}] {str(a.get('desc'))[:110]}"
                     + (f" | 原文: {_ev}" if _ev else "")
                 )
         if state.planner.blockers:
@@ -615,7 +961,7 @@ class DeepAgentGraph:
                 + "\n".join(f"  · {str(s)[:160]}" for s in _sns[:3]) + "\n"
             )
 
-        # ── 确定性扫描种子（nuclei 预扫命中，规划起点：机器枚举打底）────
+        # ── 侦察种子（主动扫描 + 被动 OSINT 命中，规划起点：机器枚举打底）──
         scan_hint = ""
         if state.planner.scan_seeds:
             _sl = []
@@ -626,8 +972,9 @@ class DeepAgentGraph:
                     + (f" | {_ev}" if _ev else "")
                 )
             scan_hint = (
-                "\n━━━ 确定性扫描种子（nuclei 预扫已命中，规划必须优先利用："
-                "端点/技术栈/CVE 假设直接基于种子构造，禁止重新盲目探测同一目标）━━━\n"
+                "\n━━━ 侦察种子（主动扫描 nuclei/nmap/ffuf/httpx/katana/naabu + 被动 OSINT "
+                "crt.sh/subfinder/gau/dnsx 已命中，规划必须优先利用：端点/技术栈/CVE 假设"
+                "直接基于种子构造，禁止重新盲目探测同一目标）━━━\n"
                 + "\n".join(_sl) + "\n"
             )
 
@@ -749,8 +1096,8 @@ class DeepAgentGraph:
         if state.planner.force_pivot:
             stalled = state.planner.current_vuln_focus or "当前方向"
             done_dirs = list(set(state.planner.stalled_directions + state.planner.completed_directions))
-            all_top10 = list(_OWASP_DIRECTIONS)
-            remaining = [d for d in all_top10 if not any(d[:3] in done for done in done_dirs)]
+            done_codes = {_dir_code(d) for d in done_dirs}
+            remaining = [d for d in _ALL_DIRECTION_NAMES if _dir_code(d) not in done_codes]
             pivot_instruction = f"""
 ⚠️ 【强制切换方向】「{stalled}」已完成或停滞。禁止重复: {done_dirs}。剩余方向: {remaining}。立即切换到第一个剩余方向。
 """
@@ -846,11 +1193,11 @@ class DeepAgentGraph:
 已停滞: {state.planner.stalled_directions}
 被拒策略: {json.dumps(_rejected_brief, ensure_ascii=False)[:100]}
 {"历史经验: " + "; ".join(state.planner.long_term_goals[:3]) if state.planner.long_term_goals else ""}
-{_dup_brief}{tried_payloads_hint}{same_output_hint}{kb_hint}{skill_hint}{pattern_hint}{chain_hint}{scan_hint}{threat_hint}{asset_hint}{next_hops_hint}{steering_hint}{pivot_instruction}
+{_dup_brief}{tried_payloads_hint}{same_output_hint}{kb_hint}{skill_hint}{ctf_hint}{domain_hint}{scenario_hint}{scenario_payload_hint}{pattern_hint}{chain_hint}{scan_hint}{threat_hint}{asset_hint}{next_hops_hint}{steering_hint}{pivot_instruction}
 
-━━━ OWASP Top10（逐一测试，3轮无果换方向）━━━
-{state.planner.applicable_directions or 'A01-访问控制 | A02-加密失败 | A03-SQL注入 | A04-不安全设计 | A05-安全配置错误 | A06-已知漏洞组件 | A07-身份认证失败 | A08-完整性失败 | A09-日志缺失 | A10-SSRF'}
-{"（已排除不适用方向，优先测试列出的方向）" if state.planner.applicable_directions else ""}
+━━━ 攻击面方向（域 × 子方向，逐一测试，3轮无果换方向）━━━
+{state.planner.applicable_directions or (' | '.join(_ALL_DIRECTION_NAMES))}
+{"（已按目标域筛选适用方向，优先测试列出的方向）" if state.planner.applicable_directions else ""}
 
 ━━━ 可用工具 ━━━
 {tool_desc_lines}
@@ -864,12 +1211,18 @@ class DeepAgentGraph:
   空间测绘(FOFA/Quake):         cat "{_RECON_PLAYBOOK_DIR}/05-cyberspace-search.md"
   JS 端点/敏感信息:             cat "{_RECON_PLAYBOOK_DIR}/06-analyze-js.md"
   鉴权绕过 Fuzz:                cat "{_RECON_PLAYBOOK_DIR}/07-fuzz-auth-bypass.md"
-  确定性漏洞指纹扫描(nuclei):   & "{_NUCLEI_BIN}" -t "{_NUCLEI_TEMPLATES}\\http" -u <目标URL> -duc -silent -c 10 -timeout 15
-    子集按需指定: -t "...\\http\\technologies"（指纹） / -t "...\\http\\cves"（CVE 对照） / -t "...\\http\\exposures"（暴露面）
+  确定性漏洞指纹扫描(nuclei):   & "{_NUCLEI_BIN}" -t "{_NUCLEI_TEMPLATES}\\http\\<子集>" -u <目标URL> -duc -silent -no-color -c 25 -timeout 8
+    子集按需指定: -t "...\\http\\technologies"（指纹） / -t "...\\http\\exposures\\files"（敏感文件暴露） / -t "...\\http\\exposures\\logs"（日志泄露）
     铁律: 引擎与模板只用上述项目内路径，禁止 -update-templates 或使用 AppData 默认目录；命中项仅作种子假设，仍须手动验证。
+    警告: 禁止 -t "...\\http\\cves" 全量扫（2000-2024 上千模板会跑爆超时）——CVE 对照必须按技术栈/年份精确定位，如 -t "...\\http\\cves\\2024\\CVE-2024-xxxx.yaml"，且预扫已含指纹，只需补针对性 CVE。
   端口扫描引擎(nmap):           & "{_nmap_path() or 'nmap'}" -sV -Pn --top-ports 100 <目标host>
   目录爆破引擎(ffuf):           & "{_FFUF_BIN}" -w <字典文件> -u <目标URL>/FUZZ -mc 200,301,302,403 -t 8 -timeout 10
-    ffuf 字典: 项目无内置字典时先用 execute_python 写 ≤200 条常见路径小字典到临时文件再 -w 引用；禁大字典高并发
+   ffuf 字典: -w 引用本地字典库文件（见下方"字典库"块）；库内无适配字典时先用 execute_python 写 ≤200 条常见路径小字典到临时文件再 -w 引用；禁大字典高并发
+
+━━━ 字典库（目标爆破/口令类任务的本地字典源）━━━
+路径: {_WORDLIST_DIR}{'（当前目录不可用，回退内置小字典）' if not _wordlist_dir() else ''}
+可用文件: {'；'.join(_wordlist_catalog()) if _wordlist_catalog() else '（空）'}
+用法铁律: ① 目录爆破/弱口令爆破 -w 直接引用上述目录内文件的绝对路径；② 大字典（≥2万行，如 3-5w.txt）仅限定向低频任务执行，-t ≤8 且严格超时禁止高并发全量跑；③ 登录框弱口令爆破：中文站优先 CN_username*.txt × passwd-EN-Top10000.txt（或 rockyou-top15000.txt）组合，单轮爆破量 ≤5000 条、同表单禁止无限重试（防锁定），按响应差异甄别结果；④ 任务 description 注明引用的字典文件名
 
 ━━━ 漏洞知识库（SKILL.md 是主要参考/查询笔记，禁止凭印象编造 payload）━━━
 定位流程（构造任何 Payload/绕过前强制执行）:
@@ -897,6 +1250,8 @@ class DeepAgentGraph:
 5. 【深挖】SQL注入确认后必须提取数据（库/表/字段/flag），使用完整查询
 6. 【文档】test_plan 是全程主线: init 生成 → update 修订增补 → tasks 必须与文档用例对应，found 用例的漏洞证据以 desc 记录，最终报告以文档为准
 7. 【组合】生成任务前必须先盘点"组合利用工作台"：资产面板中已确认漏洞的产物（源码/凭据/文件读能力/注入原语）必须成为本轮其他方向任务的输入，构造多漏洞联动利用链（例: 文件包含读源码→源码泄露过滤逻辑→构造绕过→反序列化RCE），禁止各方向孤立测试、禁止丢弃已到手资产重新盲测
+7b. 【跨域】资产带来源域标签（Web/AI）：跨域产物必须作他域任务输入——Web 域拿到的凭据/接口/源码可作 AI-LLM 域 MCP 攻击、Prompt 注入的跳板；AI 域发现的工具调用/外部数据源可反哺 Web 域 SSRF/越权测试。禁止把资产锁死在来源域内
+7c. 【源码驱动】资产面板存在 source-code-analysis 资产时，反序列化/POP 链/对象注入类任务必须严格基于已解析的类名/属性/魔术方法构造 payload（description 中写出具体类名与属性链），禁止盲猜类名/属性名；若要利用的点需要类定义（PHP 反序列化/对象注入等）而资产面板尚无源码情报，本轮必须先排"获取源码"信息收集任务（php://filter 读源码/备份文件/.git 泄露/文件包含读文件等），禁止跳过信息收集直接盲试
 8. 【续接】未破门槛列表中的每一项，本轮 tasks 都必须包含至少一个针对它的突破尝试；引用证据原文时在 description 写"基于证据 E{id}"（证据ID见组合利用工作台）"""
 
         try:
@@ -1115,7 +1470,7 @@ class DeepAgentGraph:
         _PARALLEL_TOOLS = {"execute_python", "knowledge_search", "knowledge_get_detail", "knowledge_save"}
         # 各工具的超时上限（秒）：快失败避免单任务拖死整轮
         _TOOL_TIMEOUTS = {
-            "execute_python": 150, "execute_shell": 90, "browser_navigate": 120,
+            "execute_python": 150, "execute_shell": 120, "browser_navigate": 120,
             "browser_execute_js": 60, "browser_get_content": 60, "browser_screenshot": 60,
             "knowledge_search": 45, "knowledge_get_detail": 45, "knowledge_save": 45,
             "proxy_list_traffic": 60, "proxy_get_flow": 60, "proxy_clear_traffic": 60,
@@ -1356,6 +1711,8 @@ class DeepAgentGraph:
                     continue
                 a["round"] = _round_no
                 a["evidence"] = str(a.get("evidence") or "")[:250]
+                # 域标签：标记资产来源域，供跨域联动（如 web 域凭据 → ai-llm 域 MCP 攻击）
+                a["domain"] = _CODE_TO_DOMAIN.get(_dir_code(state.planner.current_vuln_focus or ""), "")
                 state.planner.assets.append(a)
                 _a_keys.add(_k)
             state.planner.assets = state.planner.assets[-24:]
@@ -1384,6 +1741,29 @@ class DeepAgentGraph:
             _new_ev = self._extract_evidence(state.current_results, _round_no)
             if _new_ev:
                 state.planner.evidence_vault = (state.planner.evidence_vault + _new_ev)[-24:]
+
+            # ── 源码情报强制衔接（问题二：信息收集 → 利用 脱节）────────
+            # 服务端确定性解析本轮输出中的 类/魔术方法/属性/危险调用 → 结构
+            # 化入资产面板（复用 _a_keys 去重 + 域标签），并写 chain_notes
+            # 强制下一轮任务基于已解析结构构造 payload，禁止盲猜类名/属性。
+            _src_intel = self._extract_source_intel(state.current_results, _round_no)
+            _src_notes: List[str] = []
+            for _si in _src_intel:
+                _k = f"{str(_si.get('kind'))}|{str(_si.get('desc'))[:60]}"
+                if _k in _a_keys:
+                    continue
+                _si["domain"] = str(_si.get("domain") or _CODE_TO_DOMAIN.get(
+                    _dir_code(state.planner.current_vuln_focus or ""), ""))
+                state.planner.assets.append(_si)
+                _a_keys.add(_k)
+                _src_notes.append(
+                    f"[R{_round_no}] 源码情报: 类 {', '.join(_si.get('classes') or [])[:36]}"
+                    f" 魔术方法 {', '.join(_si.get('magic_methods') or [])[:24]}"
+                    f" → 下一轮构造 payload 必须基于此，禁止盲猜类名/属性名"
+                )
+            if _src_notes:
+                state.planner.assets = state.planner.assets[-24:]
+                state.planner.chain_notes = (state.planner.chain_notes + _src_notes)[-16:]
 
             # 确认漏洞 → 写入 confirmed_vulns，并标记方向完成、触发 pivot
             # 对抗式验证关卡：仅证伪者判 SURVIVED 的候选允许进入 confirmed_vulns
@@ -1607,6 +1987,20 @@ class DeepAgentGraph:
                 entry = {"tool": tool, "task": task_desc, key: val}
                 if meta:
                     entry["meta"] = " | ".join(f"{k}={v}" for k, v in meta.items())
+
+                # 响应指纹：结构化回传沙箱内 HTTP 响应的 status/length/片段，
+                # 让 Reflector 做响应差异对比（而非只看 stdout 文本 / 只看"都返回 200"）
+                fps = None
+                if isinstance(raw_val, dict):
+                    fps = raw_val.get("http_fingerprints") or []
+                if fps:
+                    fp_lines = []
+                    for fp in fps[:20]:
+                        fp_lines.append(
+                            f"[{fp.get('status')}] len={fp.get('length')} "
+                            f"{str(fp.get('url'))[:90]} :: {str(fp.get('snippet'))[:90]}"
+                        )
+                    entry["http_fingerprints"] = "\n".join(fp_lines)
                 out.append(entry)
             return out
 
@@ -1702,7 +2096,8 @@ no_finding — 结果为空、无响应差异、工具失败
 
         try:
             # 判定类调用使用低温：漏洞证据判定需要稳定可复现，避免同样证据一次 confirmed 一次 no_finding
-            content = await _llm_invoke_with_retry(self.llm, prompt, temperature=0.2)
+            # fast=True：反思是每轮 1 次的高频判定，走 LLM_FAST_MODEL 分流
+            content = await _llm_invoke_with_retry(self.llm, prompt, temperature=0.2, fast=True)
             data = _extract_json(content) or {}
         except Exception as e:
             logger.error("reflection_llm_failed", error=str(e))
@@ -1717,14 +2112,14 @@ no_finding — 结果为空、无响应差异、工具失败
             data["finding_level"] = "no_finding"
 
         # ── 代码校验 goal_achieved：LLM 不可信，必须满足以下条件才真正结束 ──
-        _ALL_DIRECTIONS = {"A01", "A02", "A03", "A04", "A05", "A06", "A07", "A08", "A09", "A10"}
+        _ALL_DIRECTION_CODES = set(_DIR_BY_CODE.keys())
         _done_dirs = set(state.planner.completed_directions) | set(state.planner.stalled_directions)
-        _covered = {d[:3] for d in _done_dirs}
-        # 目标校验集 = 预筛后的适用方向（applicable_directions）；若未预筛则默认全 10。
+        _covered = {_dir_code(d) for d in _done_dirs}
+        # 目标校验集 = 预筛后的适用方向（applicable_directions）；若未预筛则默认全部方向。
         # 否则被预筛排除的不适用方向永远不进 completed/stalled，issubset 恒 False，
         # goal_achieved 永不触发、agent 只能跑到 max_iter。
         _applicable = state.planner.applicable_directions
-        _required = {d[:3] for d in _applicable} if _applicable else _ALL_DIRECTIONS
+        _required = {_dir_code(d) for d in _applicable} if _applicable else _ALL_DIRECTION_CODES
         _goal_achieved_safe = _required.issubset(_covered)
         # 如果 LLM 说完成但条件不满足，强制设为 False
         if data.get("goal_achieved") and not _goal_achieved_safe:
@@ -1783,7 +2178,8 @@ no_finding — 结果为空、无响应差异、工具失败
 }}"""
 
         try:
-            content = await _llm_invoke_with_retry(self.llm, prompt)
+            # fast=True：STE 经验提取是高频判定（每轮有成功结果即触发），走 LLM_FAST_MODEL 分流
+            content = await _llm_invoke_with_retry(self.llm, prompt, fast=True)
             data = _extract_json(content)
             if not data:
                 return None
@@ -1802,14 +2198,39 @@ no_finding — 结果为空、无响应差异、工具失败
     # ------------------------------------------------------------------
 
     async def _analyze_target_directions(self, state: DeepAgentState) -> None:
-        """第一轮启动时，快速分析 URL 特征，筛选适用的 OWASP Top10 方向。"""
+        """第一轮启动时，识别目标所属攻击面域，生成适用的方向清单（域 × 子方向）。
+
+        域判定（规则引擎先行）：
+        - web 域：默认适用（绝大多数目标含 Web 面；AI 应用也多带 Web 前端）
+        - ai-llm 域：目标描述命中 AI/LLM 关键词时追加（LLM/Prompt/Agent/MCP/RAG/
+          越狱/大模型/智能体/聊天机器人等；关键词取精确形式避免误判，如不用裸 "ai"/
+          "rag"/"模型"，防 "domain"/"storage"/"数据模型" 误命中）
+        子方向排除：web 域仍按 URL 特征排除明显不适用的方向（如无登录面则排除 A07）。
+        """
         url_match = re.search(r'https?://[^\s\u4e00-\u9fff]+', state.current_goal)
         target_url = url_match.group(0) if url_match else ""
+        goal_low = state.current_goal.lower()
 
-        _all = list(_OWASP_DIRECTIONS)
+        # ── 域判定 ──
+        _AI_KEYWORDS = (
+            "llm", "大模型", "大语言模型", "agent", "智能体", "多agent", "多智能体",
+            "prompt", "提示词", "提示注入", "mcp", "越狱", "jailbreak", "chatbot",
+            "聊天机器人", "chatgpt", "claude", "openai", "检索增强", "rag投毒",
+            "知识库问答", "对话系统", "模型窃取", "模型越狱",
+        )
+        is_ai_target = any(kw in goal_low for kw in _AI_KEYWORDS)
+
+        # 方向全名：web 域默认全量 + ai-llm 域（命中 AI 目标时追加）
+        web_dirs = [
+            f"{code}-{name}" for code, name in _DIRECTION_CATALOG["web"]["directions"].items()
+        ]
+        ai_dirs = [
+            f"{code}-{name}" for code, name in _DIRECTION_CATALOG["ai-llm"]["directions"].items()
+        ]
+        _all = web_dirs + (ai_dirs if is_ai_target else [])
+
+        # ── 子方向排除（仅 web 域，规则引擎先行）──
         excluded = set()
-
-        # 规则引擎先行：根据 URL 特征快速排除明显不适用的方向
         has_login = any(kw in state.current_goal for kw in ["login", "signin", "登录", "认证", "auth", "password"])
         if not has_login and target_url:
             parsed = target_url.split("/")[-1].lower()
@@ -1820,13 +2241,15 @@ no_finding — 结果为空、无响应差异、工具失败
 
         if excluded:
             # LLM 快速确认排除是否合理
-            prompt = f"""分析以下目标，判断是否需要排除任何 OWASP 测试方向。
+            prompt = f"""分析以下目标，判断是否需要排除任何测试方向。
 目标: {state.current_goal[:200]}
 URL: {target_url}
+目标域: {"Web + AI/LLM" if is_ai_target else "Web"}
 可能排除: {list(excluded)}
 如果排除合理，输出"确认"；如果需要额外保留某方向，输出需保留的方向编号。只输出结果。"""
             try:
-                result = await _llm_invoke_with_retry(self.llm, prompt, temperature=0.2)
+                # fast=True：方向预筛是低温判定（首轮 1 次），走 LLM_FAST_MODEL 分流
+                result = await _llm_invoke_with_retry(self.llm, prompt, temperature=0.2, fast=True)
                 if "确认" in result:
                     state.planner.applicable_directions = remaining
                 else:
@@ -1835,6 +2258,9 @@ URL: {target_url}
                 state.planner.applicable_directions = remaining
         else:
             state.planner.applicable_directions = _all
+
+        if is_ai_target:
+            logger.info("target_domain_ai_detected", ai_directions=ai_dirs)
 
         # ── 加载跨会话历史经验（从知识库持久化数据恢复）───────────────
         await self._load_session_context(state, target_url)
@@ -2083,7 +2509,7 @@ URL: {target_url}
         """
         if not self.knowledge_router or not vuln_focus:
             return ""
-        cache_key = vuln_focus.strip()[:3]
+        cache_key = _dir_code(vuln_focus)
         if cache_key in self._kb_cache:
             return self._kb_cache[cache_key]
         _FOCUS_QUERY = {
@@ -2097,8 +2523,15 @@ URL: {target_url}
             "A08": "JWT none algorithm HMAC deserialization gadget",
             "A09": "log injection audit bypass",
             "A10": "SSRF internal metadata 169.254 dnslog ceye",
+            "L01": "prompt injection indirect prompt system prompt leak",
+            "L02": "jailbreak DAN many-shot adversarial suffix role escape",
+            "L03": "MCP tool poisoning instruction override model context protocol",
+            "L04": "agent abuse tool misuse chain of thought injection",
+            "L05": "RAG poisoning knowledge base poisoning data injection",
+            "L06": "sandbox escape container escape isolation bypass",
+            "L07": "model extraction adversarial sample model stealing",
         }
-        key = vuln_focus[:3]
+        key = _dir_code(vuln_focus)
         base_query = _FOCUS_QUERY.get(key, vuln_focus)
         try:
             all_results = []
@@ -2148,7 +2581,7 @@ URL: {target_url}
         """按当前方向 + 任务描述关键词确定要注入的 skill 手册文件名。"""
         files: List[str] = []
         if vuln_focus:
-            f = _SKILL_BY_DIR.get(vuln_focus.strip()[:3])
+            f = _SKILL_BY_DIR.get(_dir_code(vuln_focus))
             if f and f not in files:
                 files.append(f)
         low = (task_desc or "").lower()
@@ -2158,14 +2591,19 @@ URL: {target_url}
         return files[:2]
 
     def _read_skill_snippet(self, filename: str, max_chars: int = 1000) -> str:
-        """读取 secknowledge 手册并提取 payload/绕过相关片段（带内容缓存）。
+        """读取 skill 手册（secknowledge 或 ctf-web）并提取 payload/绕过片段（带缓存）。
 
+        filename 带 "ctf-web/" 前缀 → 读 ctf-web 平铺目录；否则读 secknowledge references/。
         大文件不整读：优先定位 Payload/Bypass/POC 章节，取其后 max_chars 字符；
         找不到则取文件头部，保证注入内容高密度可执行。
         """
         if filename in self._skill_cache:
             return self._skill_cache[filename]
-        path = os.path.join(_SECKNOWLEDGE_DIR, "references", filename)
+        _CTF_PREFIX = "ctf-web/"
+        if filename.startswith(_CTF_PREFIX):
+            path = os.path.join(_CTF_WEB_DIR, filename[len(_CTF_PREFIX):])
+        else:
+            path = os.path.join(_SECKNOWLEDGE_DIR, "references", filename)
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
@@ -2206,6 +2644,31 @@ URL: {target_url}
             "\n━━━ 渗透 skill 手册精选（已注入，直接使用其中 payload/绕过，无需再 cat 读取）━━━\n"
             + "\n\n".join(parts) + "\n"
         )[:2400]
+
+    def _fetch_ctf_payloads(self, vuln_focus: str, task_desc: str) -> str:
+        """注入 CTF Web 进阶手册片段（ctf-web 目录，web 域进阶 exploit 技巧）。
+
+        独立于 skill_hint：按任务关键词匹配 ctf-web 文件，注入 1 个进阶文件，
+        与 secknowledge 的基础方法论互补。仅在命中关键词时返回，避免无谓膨胀。
+        """
+        low = (task_desc or "").lower()
+        picked: List[str] = []
+        for pattern, f in _CTF_WEB_KEYWORD_FILES:
+            if re.search(pattern, low) and f not in picked:
+                picked.append(f)
+        if not picked:
+            return ""
+        parts = []
+        for f in picked[:1]:  # 只注入 1 个进阶文件，控制提示词长度
+            snip = self._read_skill_snippet(f)
+            if snip:
+                parts.append(f"—— 《{f}》 ——\n{snip}")
+        if not parts:
+            return ""
+        return (
+            "\n━━━ CTF Web 进阶手册（高级绕过/链式利用，用于突破基础 payload 被过滤的场景）━━━\n"
+            + "\n\n".join(parts) + "\n"
+        )[:1600]
 
     _EVIDENCE_SOURCE_PAT = re.compile(
         r"<\?php|class\s+\w+|function\s+\w+|def\s+\w+|preg_match"
@@ -2249,6 +2712,86 @@ URL: {target_url}
                 "round": round_no,
             })
         return evs
+
+    # ── 源码情报解析（信息收集 → 利用 的强制衔接）─────────────────────
+    # 上次实例教训：反序列化题盲猜类名（O:4:"GWHT"…Yasuo/Yongen）烧光 10 轮
+    # 却没先把源码解析成结构化情报。服务端确定性解析（不依赖 LLM 自觉）：
+    # 一旦结果中出现 PHP 类定义 + 魔术方法，自动提取类名/属性/魔术方法/
+    # 危险调用写入资产面板，Planner 下一轮必须基于它构造 payload，禁止盲猜。
+    _SRC_CLASS_PAT = re.compile(r"(?<![\$\w@])class\s+(\w+)\s*[\{:]")
+    _SRC_MAGIC_PAT = re.compile(
+        r"function\s+__(construct|destruct|toString|wakeup|sleep|call|get|set|invoke|debugInfo)\s*\(",
+        re.IGNORECASE,
+    )
+    _SRC_PROP_PAT = re.compile(r"(?:public|private|protected)\s+\$(\w+)")
+    _SRC_DANGER_PAT = re.compile(
+        r"(file_get_contents|unserialize|eval\s*\(|system\s*\(|exec\s*\(|shell_exec|passthru|include\s*\(|require\s*\()",
+        re.IGNORECASE,
+    )
+
+    def _extract_source_intel(self, results: List[Dict[str, Any]], round_no: int) -> List[Dict[str, Any]]:
+        """从本轮结果中自动解析源码结构情报（类/魔术方法/属性/危险调用）。
+
+        返回结构化资产条目列表（kind=source-code-analysis）；实例级指纹去重。
+        提取失败静默返回空列表，不影响主流程。
+        """
+        intel: List[Dict[str, Any]] = []
+        for r in results or []:
+            out = r.get("output") or r.get("stdout") or r.get("result") or ""
+            if isinstance(out, dict):
+                out = json.dumps(out, ensure_ascii=False)
+            text = str(out)
+            if len(text) < 40 or len(text) > 30000:
+                continue
+
+            classes = sorted(set(self._SRC_CLASS_PAT.findall(text)))
+            if len(classes) < 1:
+                continue
+            magics = sorted(set("__" + m.lower() for m in self._SRC_MAGIC_PAT.findall(text)))
+            props = sorted(set(self._SRC_PROP_PAT.findall(text)))
+            dangers = sorted(set(d.lower() for d in self._SRC_DANGER_PAT.findall(text)))
+
+            # 仅有 1 个类且无魔术方法/危险调用 → 面太窄（可能是翻到 class 字样），不产情报
+            if len(classes) == 1 and not magics and not dangers:
+                continue
+
+            fp = ",".join(classes)
+            if fp in self._source_intel_seen:
+                continue
+            self._source_intel_seen.add(fp)
+
+            desc_parts = [f"源码已解析, 类: {', '.join(classes[:6])}"]
+            if props:
+                desc_parts.append(f"属性: ${', $'.join(props[:8])}")
+            if magics:
+                desc_parts.append(f"魔术方法: {', '.join(magics[:6])}")
+            if dangers:
+                desc_parts.append(f"危险调用: {', '.join(dangers[:6])}")
+            desc = "；".join(desc_parts) + " → 构造利用 payload 必须基于这些类定义，禁止盲猜类名/属性名"
+
+            # evidence：截取首个类定义附近文本 + 魔术方法附近片段（原文锚定）
+            ev_parts = []
+            m0 = self._SRC_CLASS_PAT.search(text)
+            if m0:
+                ev_parts.append(text[m0.start():m0.start() + 300])
+            for mm in list(self._SRC_MAGIC_PAT.finditer(text))[:2]:
+                ev_parts.append(text[max(0, mm.start() - 80):mm.start() + 160])
+            evidence = "\n".join(ev_parts)[:300]
+
+            intel.append({
+                "kind": "source-code-analysis",
+                "desc": desc[:180],
+                "evidence": evidence,
+                "round": round_no,
+                "classes": classes[:6],
+                "magic_methods": magics[:6],
+                "properties": props[:8],
+                "dangers": dangers[:6],
+                # PHP 特征（$属性/魔术方法）→ web 域；否则交由 Reflector 按当前方向补域标签
+                "domain": "web" if (props or magics) else "",
+            })
+            logger.info("source_intel_extracted", classes=classes[:6], magics=magics[:3])
+        return intel
 
     # ------------------------------------------------------------------
     # 入口

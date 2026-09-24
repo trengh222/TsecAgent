@@ -565,6 +565,11 @@ async def _run_nuclei_seeds(url: str) -> list:
 
     超时盒 90 秒：超时/工具缺失/解析失败一律静默降级为空列表（不阻塞任务）。
     命中项仅作"种子假设"，进入 Planner 后仍须验证。
+
+    模板范围刻意收敛为「指纹(technologies) + 敏感文件(exposures/files)」两个
+    快速子集——全量 cves（2000-2024 按年组织，上千模板）与 exposures/tokens
+    （数百 API key 检测）对预扫来说太重且对 CTF 靶场价值低，会拖到 90s 超时。
+    CVE 线索由 Planner 在拿到技术栈后按需用 execute_shell 针对性跑。
     """
     from deepagent.graph import _NUCLEI_BIN, _NUCLEI_TEMPLATES, _nuclei_available
     if not _nuclei_available():
@@ -576,11 +581,10 @@ async def _run_nuclei_seeds(url: str) -> list:
     cmd = [
         _NUCLEI_BIN,
         "-t", os.path.join(_tpl, "http", "technologies"),
-        "-t", os.path.join(_tpl, "http", "exposures"),
-        "-t", os.path.join(_tpl, "http", "cves"),
+        "-t", os.path.join(_tpl, "http", "exposures", "files"),
         "-u", url,
-        "-duc", "-silent", "-jsonl", "-o", out_path,
-        "-c", "10", "-timeout", "15",
+        "-duc", "-silent", "-no-color", "-jsonl", "-o", out_path,
+        "-c", "25", "-timeout", "8",
     ]
     rc = await asyncio.to_thread(_run_cmd_sync, cmd, 90.0)
     if rc != 0:
@@ -638,8 +642,47 @@ _FFUF_PATHS = [
     "vendor", "composer.json", ".git/config", "web", "app", "main", "include",
 ]
 
+
+def _build_ffuf_wordlist(dict_path: str) -> bool:
+    """组装 ffuf 预扫字典：优先合并用户字典库小字典（springboot/Java_file/文件读取），
+    结合内置高频路径；字典库缺失时仅用内置 _FFUF_PATHS。
+
+    单文件上限 800 行、总条数有限——控制在 40s 超时盒可完成的范围，
+    大字典（3-5w 等）不进预扫，由 Planner 定向任务按需 -w 引用。
+    """
+    from deepagent.graph import _wordlist_dir, _WORDLIST_SMALL_FILES
+    entries: list = []
+    wl_dir = _wordlist_dir()
+    if wl_dir:
+        for name in _WORDLIST_SMALL_FILES:
+            p = os.path.join(wl_dir, name)
+            try:
+                with open(p, encoding="utf-8", errors="ignore") as f:
+                    got = [ln.strip().lstrip("/") for ln in f if ln.strip()]
+            except Exception:
+                continue
+            got = {e for e in got if " " not in e}   # 含空格行不适合 ffuf FUZZ
+            entries.extend(sorted(got)[:800])
+    entries.extend(_FFUF_PATHS)
+    if not entries:
+        return False
+    try:
+        with open(dict_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(dict.fromkeys(e for e in entries if e)))
+        return True
+    except Exception:
+        return False
+
 _NMAP_TIMEOUT = 120
 _FFUF_TIMEOUT = 40
+_PASSIVE_TIMEOUT = 15  # 被动侦察（OSINT）单源超时（秒）
+# 扩预扫 4 路新增工具的超时盒（秒）——任一超时即 kill，静默降级
+_SUBFINDER_TIMEOUT = 40
+_DNSX_TIMEOUT = 20
+_HTTPX_TIMEOUT = 30
+_KATANA_TIMEOUT = 30
+_GAU_TIMEOUT = 30
+_NAABU_TIMEOUT = 90
 
 
 def _run_cmd_sync(cmd: list, timeout: float) -> int:
@@ -658,8 +701,30 @@ def _run_cmd_sync(cmd: list, timeout: float) -> int:
         return -2
 
 
-async def _run_nmap_seeds(url: str) -> list:
-    """nmap 端口/服务预扫（--top-ports 100，greppable 输出），返回 port 种子。"""
+def _run_cmd_capture(cmd: list, timeout: float) -> str:
+    """同步执行子进程并捕获 stdout 文本（线程池内运行）。
+
+    与 _run_cmd_sync 同策略：超时/异常返回空字符串（调用方静默降级）。
+    """
+    import subprocess as sp
+    try:
+        p = sp.run(cmd, capture_output=True, text=True, timeout=timeout,
+                   encoding="utf-8", errors="ignore")
+        return p.stdout or ""
+    except Exception:
+        return ""
+
+
+async def _no_seeds() -> list:
+    """占位空种子（gather 分支用），保持并行调用签名一致。"""
+    return []
+
+
+async def _run_nmap_seeds(url: str, ports: Optional[list] = None) -> list:
+    """nmap 端口/服务预扫（greppable 输出），返回 port 种子。
+
+    ports 非空时（来自 naabu 广扫命中）只精测这些端口；否则退化 --top-ports 100。
+    """
     from deepagent.graph import _nmap_path
     from urllib.parse import urlparse
     nmap_bin = _nmap_path()
@@ -671,7 +736,13 @@ async def _run_nmap_seeds(url: str) -> list:
 
     import tempfile
     out_path = tempfile.NamedTemporaryFile(suffix=".gnmap", delete=False).name
-    cmd = [nmap_bin, "-sV", "-Pn", "--top-ports", "100", "-oG", out_path, host]
+    if ports:
+        _port_list = sorted({str(p) for p in ports if str(p).isdigit()},
+                            key=lambda p: int(p))[:50]
+        cmd = [nmap_bin, "-sV", "-Pn", "-p", ",".join(_port_list),
+               "-oG", out_path, host]
+    else:
+        cmd = [nmap_bin, "-sV", "-Pn", "--top-ports", "100", "-oG", out_path, host]
     rc = await asyncio.to_thread(_run_cmd_sync, cmd, float(_NMAP_TIMEOUT))
     if rc != 0:
         logger.warning("nmap_prescan_failed", host=host, rc=rc)
@@ -728,8 +799,8 @@ async def _run_ffuf_seeds(url: str) -> list:
     dict_path = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
     out_path = tempfile.NamedTemporaryFile(suffix=".json", delete=False).name
     try:
-        with open(dict_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(_FFUF_PATHS))
+        # 优先用户字典库小字典 + 内置路径合并；失败（字典库缺失）回退内置
+        _build_ffuf_wordlist(dict_path)
     except Exception:
         return []
 
@@ -773,31 +844,368 @@ async def _run_ffuf_seeds(url: str) -> list:
     return seeds
 
 
-async def _run_prescan(url: str) -> list:
-    """确定性预扫总入口：nuclei + nmap + ffuf 并行，结果合并去重为种子列表。
+# ── 扩预扫（新增 4 路）：subfinder/dnsx/httpx/katana/gau/naabu ────────
+#    全部 Go 单文件（langGraph/tools/），超时盒内运行，缺失/超时静默降级。
+#    定位：机器枚举打底 → 子域全量发现、存活指纹、爬虫端点、历史 URL、
+#    广扫端口（喂 nmap -sV 精测），把"信息收集"的确定性面撑到最宽。
 
-    任一环节超时/失败/工具缺失均静默降级（空列表），绝不阻塞任务。
+async def _run_subfinder_seeds(domain: str) -> list:
+    """subfinder 被动子域枚举（聚合 40+ 免费源），返回 subdomain 种子。"""
+    from deepagent.graph import _SUBFINDER_BIN
+    if not os.path.exists(_SUBFINDER_BIN) or not domain:
+        return []
+    cmd = [_SUBFINDER_BIN, "-d", domain, "-silent", "-timeout", "8"]
+    out = await asyncio.to_thread(_run_cmd_capture, cmd, float(_SUBFINDER_TIMEOUT))
+    seeds, seen = [], set()
+    for line in out.splitlines():
+        s = line.strip().lower().rstrip(".")
+        if not s or s in seen or s == domain or not s.endswith("." + domain):
+            continue
+        seen.add(s)
+        seeds.append({"kind": "subdomain", "desc": f"子域名: {s}",
+                      "evidence": s, "covered": False})
+        if len(seeds) >= 8:
+            break
+    return seeds
+
+
+async def _run_dnsx_seeds(domain: str, subdomains: list) -> list:
+    """dnsx 解析主域+已知子域（A/AAAA/CNAME），返回存活子域种子（含 IP）。
+
+    输入子域来自 subfinder/crt.sh；resolve 失败（不存活）的行自然被过滤。
     """
+    from deepagent.graph import _DNSX_BIN
+    if not os.path.exists(_DNSX_BIN) or not domain:
+        return []
+    hosts = [domain] + [str(s) for s in (subdomains or []) if str(s).strip()]
+    if not hosts:
+        return []
+
+    import tempfile
+    in_path = tempfile.NamedTemporaryFile(suffix=".txt", delete=False).name
+    try:
+        with open(in_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(dict.fromkeys(hosts)))
+    except Exception:
+        return []
+    cmd = [_DNSX_BIN, "-l", in_path, "-a", "-aaaa", "-cname", "-resp", "-silent"]
+    out = await asyncio.to_thread(_run_cmd_capture, cmd, float(_DNSX_TIMEOUT))
+    try:
+        os.unlink(in_path)
+    except Exception:
+        pass
+
+    seeds, seen = [], set()
+    for line in out.splitlines():
+        # dnsx -resp 行格式: host [TYPE] [DATA]，如 www.example.com [A] [104.20.23.154]
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        host = parts[0].strip().lower().rstrip(".")
+        rtype = parts[1].strip("[]")
+        data = parts[2].strip("[]")
+        if not host or not data or host in seen:
+            continue
+        seen.add(host)
+        seeds.append({"kind": "subdomain",
+                      "desc": f"子域存活: {host} ({rtype})",
+                      "evidence": f"{host} {rtype} {data}"[:70], "covered": False})
+        if len(seeds) >= 8:
+            break
+    return seeds
+
+
+async def _run_httpx_seeds(url: str) -> list:
+    """httpx 存活+指纹探测（status/title/server/tech），返回 target-info 种子。"""
+    from deepagent.graph import _HTTPX_BIN
+    if not os.path.exists(_HTTPX_BIN):
+        return []
+    import tempfile
+    out_path = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False).name
+    cmd = [_HTTPX_BIN, "-u", url, "-sc", "-cl", "-title", "-td", "-web-server",
+           "-silent", "-json", "-o", out_path, "-timeout", "10", "-retries", "1"]
+    rc = await asyncio.to_thread(_run_cmd_sync, cmd, float(_HTTPX_TIMEOUT))
+    if rc != 0:
+        logger.warning("httpx_prescan_failed", url=url, rc=rc)
+
+    seeds = []
+    try:
+        with open(out_path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                status = d.get("status_code")
+                length = d.get("content_length")
+                title = str(d.get("title") or "")[:40]
+                srv = str(d.get("webserver") or "")[:40]
+                techs = ", ".join(str(t) for t in (d.get("tech") or [])[:6])
+                # cdn_name/cdn_type（如 cloudflare/waf）暗示防护层，注入策略按此调整
+                cdn = str(d.get("cdn_name") or "")
+                cdn_waf = str(d.get("cdn_type") or "") == "waf"
+                desc = f"存活指纹: status={status} len={length}"
+                if title:
+                    desc += f" title={title}"
+                if srv:
+                    desc += f" server={srv}"
+                if techs:
+                    desc += f" tech=[{techs}]"
+                if cdn:
+                    desc += f" cdn={cdn}{'(waf)' if cdn_waf else ''}"
+                seeds.append({"kind": "target-info", "desc": desc[:150],
+                              "evidence": f"{url} {techs}"[:120], "covered": False})
+        seeds = seeds[:5]
+    except Exception as e:
+        logger.warning("httpx_seeds_parse_failed", error=str(e))
+    finally:
+        try:
+            os.unlink(out_path)
+        except Exception:
+            pass
+    return seeds
+
+
+async def _run_katana_seeds(url: str) -> list:
+    """katana 主动爬虫（深 2 层 + JS 提取 + 表单/端点），返回 endpoint 种子。"""
+    from deepagent.graph import _KATANA_BIN
+    if not os.path.exists(_KATANA_BIN):
+        return []
+    cmd = [_KATANA_BIN, "-u", url, "-d", "2", "-jc", "-c", "10",
+           "-silent", "-timeout", "8"]
+    out = await asyncio.to_thread(_run_cmd_capture, cmd, float(_KATANA_TIMEOUT))
+    seeds, seen = [], set()
+    for line in out.splitlines():
+        u = line.strip()
+        if (not u or u in seen
+                or not (u.startswith("http://") or u.startswith("https://"))):
+            continue
+        seen.add(u)
+        seeds.append({"kind": "endpoint", "desc": f"爬取端点: {u}"[:150],
+                      "evidence": u[:120], "covered": False})
+        if len(seeds) >= 15:
+            break
+    return seeds
+
+
+async def _run_gau_seeds(domain: str) -> list:
+    """gau 聚合历史 URL（Wayback/Common Crawl/OTX/URLScan），返回 historical-url 种子。
+
+    --timeout 8 限单请求耗时（默认 45s 会让整路拖死）；整体 30s 超时盒兜底。
+    """
+    from deepagent.graph import _GAU_BIN
+    if not os.path.exists(_GAU_BIN) or not domain:
+        return []
+    cmd = [_GAU_BIN, "--threads", "5", "--timeout", "8",
+           "--providers", "wayback,commoncrawl,otx,urlscan", domain]
+    out = await asyncio.to_thread(_run_cmd_capture, cmd, float(_GAU_TIMEOUT))
+    seeds, seen = [], set()
+    for line in out.splitlines():
+        u = line.strip()[:120]
+        if not u or u in seen or not (u.startswith("http://") or u.startswith("https://")):
+            continue
+        seen.add(u)
+        seeds.append({"kind": "historical-url", "desc": f"历史端点: {u}",
+                      "evidence": u, "covered": False})
+        if len(seeds) >= 10:
+            break
+    return seeds
+
+
+async def _run_naabu_ports(host: str) -> list:
+    """naabu 广扫端口（top-1000，connect 扫描免特权），返回端口列表喂 nmap 精测。"""
+    from deepagent.graph import _NAABU_BIN
+    if not os.path.exists(_NAABU_BIN) or not host:
+        return []
+    cmd = [_NAABU_BIN, "-host", host, "-top-ports", "1000",
+           "-silent", "-retries", "1"]
+    out = await asyncio.to_thread(_run_cmd_capture, cmd, float(_NAABU_TIMEOUT))
+    ports = []
+    for line in out.splitlines():
+        parts = line.strip().split(":")
+        if len(parts) >= 2 and parts[-1].isdigit():
+            ports.append(parts[-1])
+    return sorted(set(ports), key=lambda p: int(p))[:50]
+
+
+# ── 被动侦察（P2 OSINT）：证书透明度 / 历史端点 / DNS，不向目标发请求，
+#    只查公开情报源，扩展攻击面认知。与主动扫描互补，任一源失败静默降级。──
+async def _ct_subdomains(domain: str) -> list:
+    """crt.sh 证书透明度日志 → 子域名种子（无 API key）。"""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=_PASSIVE_TIMEOUT, follow_redirects=True) as client:
+            r = await client.get(f"https://crt.sh/?q=%25.{domain}&output=json")
+            data = r.json()
+    except Exception:
+        return []
+    subs: set = set()
+    for entry in (data if isinstance(data, list) else []):
+        for name in str(entry.get("name_value", "")).split("\n"):
+            name = name.strip().lower().lstrip("*.")
+            if name and name.endswith("." + domain) and name != domain:
+                subs.add(name)
+    return [
+        {"kind": "subdomain", "desc": f"子域名: {s}", "evidence": s, "covered": False}
+        for s in sorted(subs)[:10]
+    ]
+
+
+async def _wayback_urls(domain: str) -> list:
+    """Wayback Machine CDX API → 历史端点种子（无 API key）。"""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=_PASSIVE_TIMEOUT, follow_redirects=True) as client:
+            r = await client.get(
+                "http://web.archive.org/cdx/search/cdx",
+                params={"url": f"*.{domain}", "output": "json",
+                        "fl": "original", "collapse": "urlkey", "limit": 30},
+            )
+            data = r.json()
+    except Exception:
+        return []
+    urls: set = set()
+    rows = data[1:] if isinstance(data, list) and data else []
+    for row in rows:
+        if isinstance(row, list) and row and row[0]:
+            u = str(row[0]).strip()[:120]
+            if u:
+                urls.add(u)
+    return [
+        {"kind": "historical-url", "desc": f"历史端点: {u}", "evidence": u, "covered": False}
+        for u in sorted(urls)[:10]
+    ]
+
+
+async def _dns_records(domain: str) -> list:
+    """Google DoH → A/AAAA/CNAME/MX 记录种子（无 API key）。"""
+    import httpx
+    records = []
+    for rtype in ("A", "AAAA", "CNAME", "MX"):
+        try:
+            async with httpx.AsyncClient(timeout=_PASSIVE_TIMEOUT, follow_redirects=True) as client:
+                r = await client.get("https://dns.google/resolve",
+                                     params={"name": domain, "type": rtype})
+                data = r.json()
+        except Exception:
+            continue
+        for ans in (data.get("Answer") or [])[:5]:
+            records.append({
+                "kind": "dns-record",
+                "desc": f"DNS {rtype}: {ans.get('name', domain)} -> {str(ans.get('data', ''))[:60]}",
+                "evidence": str(ans.get("data", ""))[:60],
+                "covered": False,
+            })
+    return records[:10]
+
+
+async def _run_passive_seeds(url: str) -> list:
+    """被动侦察总入口（P2 OSINT）：子域名 + 历史端点 + DNS 并行，合并为种子。
+
+    与主动扫描（nuclei/nmap/ffuf）互补：不向目标发请求，只查公开情报源，
+    扩展攻击面（子域名/历史端点/关联域名）。任一源超时/失败静默降级，绝不阻塞。
+    """
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").strip().lower()
+    if not host:
+        return []
+    labels = host.split(".")
+    # IP 目标（全数字标签）跳过被动侦察
+    if all(p.isdigit() for p in labels):
+        return []
+    # 注册域近似：取最后两级标签，便于查兄弟子域名
+    domain = ".".join(labels[-2:]) if len(labels) >= 2 else host
     results = await asyncio.gather(
-        _run_nuclei_seeds(url),
-        _run_nmap_seeds(url),
-        _run_ffuf_seeds(url),
+        _ct_subdomains(domain),
+        _wayback_urls(domain),
+        _dns_records(domain),
         return_exceptions=True,
     )
     seeds: list = []
     for part in results:
         if isinstance(part, list):
             seeds.extend(part)
-    # 去重（kind + desc 指纹）
-    seen = set()
-    unique = []
-    for s in seeds:
-        sig = f"{s.get('kind')}|{str(s.get('desc'))[:60]}"
-        if sig in seen:
-            continue
-        seen.add(sig)
-        unique.append(s)
-    return unique[:30]
+    return seeds
+
+
+async def _run_prescan(url: str) -> list:
+    """确定性预扫总入口（8 路，两波执行）：
+
+    第一波（相互独立，并行）：nuclei / ffuf / httpx / katana（主动）+
+    被动 OSINT + subfinder / gau / naabu；
+    第二波（依赖第一波产物）：dnsx 解析第一波发现的子域、nmap -sV
+    精测 naabu 命中的端口（naabu 无果则退化 --top-ports 100）。
+
+    任一环节超时/失败/工具缺失均静默降级（空列表），绝不阻塞任务。
+    合并时按 lane 轮流抽取（round-robin）保证各通道都有代表进入 30 条上限。
+    """
+    from urllib.parse import urlparse
+    host = (urlparse(url).hostname or "").strip().lower()
+    labels = host.split(".") if host else []
+    domain = ".".join(labels[-2:]) if len(labels) >= 2 else host
+    _is_ip = bool(labels) and all(p.isdigit() for p in labels)
+
+    wave1 = await asyncio.gather(
+        _run_nuclei_seeds(url),
+        _run_ffuf_seeds(url),
+        _run_httpx_seeds(url),
+        _run_katana_seeds(url),
+        _run_passive_seeds(url),
+        _run_subfinder_seeds(domain) if domain and not _is_ip else _no_seeds(),
+        _run_gau_seeds(domain) if domain and not _is_ip else _no_seeds(),
+        _run_naabu_ports(host) if host else _no_seeds(),
+        return_exceptions=True,
+    )
+    (nuclei_seeds, ffuf_seeds, httpx_seeds, katana_seeds,
+     passive_seeds, subfinder_seeds, gau_seeds, naabu_ports) = wave1
+
+    # 收集第一波已发现子域（subfinder + 被动侦察 crt.sh）→ 交 dnsx 解析存活
+    sub_names: list = []
+    for part in (subfinder_seeds, passive_seeds):
+        if isinstance(part, list):
+            for s in part:
+                if isinstance(s, dict) and s.get("kind") == "subdomain":
+                    sub_names.append(str(s.get("evidence") or "").strip())
+    sub_names = [s for s in dict.fromkeys(sub_names) if s][:15]
+    if isinstance(subfinder_seeds, dict):  # 异常对象防御
+        subfinder_seeds = []
+    _nm_ports = naabu_ports if isinstance(naabu_ports, list) and naabu_ports else None
+
+    wave2 = await asyncio.gather(
+        _run_dnsx_seeds(domain, sub_names) if domain and not _is_ip else _no_seeds(),
+        _run_nmap_seeds(url, _nm_ports) if host else _no_seeds(),
+        return_exceptions=True,
+    )
+    dnsx_seeds, nmap_seeds = wave2
+    dnsx_seeds = dnsx_seeds if isinstance(dnsx_seeds, list) else []
+    nmap_seeds = nmap_seeds if isinstance(nmap_seeds, list) else []
+
+    lanes = [l for l in (nuclei_seeds, nmap_seeds, ffuf_seeds, httpx_seeds,
+                         katana_seeds, passive_seeds, subfinder_seeds,
+                         dnsx_seeds, gau_seeds) if isinstance(l, list)]
+    # round-robin 交错 + kind|desc 指纹去重，上限 30
+    seen: set = set()
+    unique: list = []
+    remaining = lanes
+    while remaining and len(unique) < 30:
+        next_remaining: list = []
+        for lane in remaining:
+            if not lane:
+                continue
+            s = lane.pop(0)
+            sig = f"{s.get('kind')}|{str(s.get('desc'))[:60]}"
+            if sig not in seen:
+                seen.add(sig)
+                unique.append(s)
+                if len(unique) >= 30:
+                    break
+            if lane:
+                next_remaining.append(lane)
+        remaining = next_remaining
+    return unique
 
 
 async def _run_agent(
