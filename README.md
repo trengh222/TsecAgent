@@ -1,6 +1,6 @@
 # TsecAgent
 
-自主渗透测试 AI Agent，基于 LangGraph 实现 **Planner → Finder → Reflector (PFR)** 循环 + **多 Agent 角色编排**（独立裁决 Agent + 独立报告 Agent），核心设计借鉴先知社区《漏洞挖掘 Agent 设计规范》：**模型只当"提出者"、绝不当"裁决者"**，所有漏洞确认必须通过对抗式证伪 + 机器校验 + 复现协议三道关卡。
+自主渗透测试 AI Agent，基于 LangGraph 实现 **Planner → Finder → Reflector (PFR)** 循环 + **多 Agent 角色编排**（独立裁决 Agent + 独立报告 Agent），所有漏洞确认必须通过对抗式证伪 + 机器校验 + 复现协议三道关卡。
 
 支持国内外主流 LLM（Anthropic / OpenAI 兼容端点：DeepSeek、通义千问、GLM、Kimi 等），Windows / Linux 双平台运行。
 
